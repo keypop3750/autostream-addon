@@ -28,7 +28,7 @@ const PREF = Object.assign(
 // ── Manifest ──────────────────────────────────────────────────────────────────
 const manifest = {
   id: "org.autostream.best",
-  version: "1.5.1",
+  version: "1.5.2",
   name: "AutoStream",
   description:
     "AutoStream picks the best stream for each title, balancing quality with speed (seeders). If a lower resolution like 1080p or 720p is much faster than 4K/2K, it’s preferred for smoother playback. You’ll usually see one link; when helpful, a second 1080p option appears. Titles are neat (e.g., “Movie Name — 1080p”).",
@@ -39,7 +39,8 @@ const manifest = {
   logo: "https://raw.githubusercontent.com/keypop3750/autostream-addon/main/logo.png",
   stremioAddonsConfig: {
     issuer: "https://stremio-addons.net",
-    signature: "eyJhbGciOiJkaXIiLCJlbmMiOiJBMTI4Q0JDLUhTMjU2In0..KPt7fOiOCod52ZjlFWg52A.dt7eIyal-1oAkU4cOG5c6YPsWn70Ds6AXqY1FJX3Ikqzzeu1gzgj2_xO4e4zh7gsXEyjhoAJ-L9Pg6UI57XD6FWjzpRcvV0v-6WuKmfZO_hDcDIrtVQnFf0nK2dnO7-n.v25_jaY5E-4yH_cxyTKfsA"
+    signature:
+      "eyJhbGciOiJkaXIiLCJlbmMiOiJBMTI4Q0JDLUhTMjU2In0..KPt7fOiOCod52ZjlFWg52A.dt7eIyal-1oAkU4cOG5c6YPsWn70Ds6AXqY1FJX3Ikqzzeu1gzgj2_xO4e4zh7gsXEyjhoAJ-L9Pg6UI57XD6FWjzpRcvV0v-6WuKmfZO_hDcDIrtVQnFf0nK2dnO7-n.v25_jaY5E-4yH_cxyTKfsA"
   }
 };
 
@@ -51,9 +52,9 @@ function qualityTag(label) {
   if (s.includes("2160") || s.includes("4k") || s.includes("uhd")) return "2160p";
   if (s.includes("1440") || s.includes("2k")) return "1440p";
   if (s.includes("1080")) return "1080p";
-  if (s.includes("720"))  return "720p";
-  if (s.includes("480"))  return "480p";
-  if (s.includes("cam"))  return "CAM";
+  if (s.includes("720")) return "720p";
+  if (s.includes("480")) return "480p";
+  if (s.includes("cam")) return "CAM";
   return "SD";
 }
 function qualityScoreFromTag(tag) {
@@ -61,10 +62,10 @@ function qualityScoreFromTag(tag) {
     case "2160p": return 4000;
     case "1440p": return 1440;
     case "1080p": return 1080;
-    case "720p":  return 720;
-    case "480p":  return 480;
-    case "CAM":   return 10;
-    default:      return 360;
+    case "720p": return 720;
+    case "480p": return 480;
+    case "CAM": return 10;
+    default: return 360;
   }
 }
 function is1080pLabel(label) { return qualityTag(label) === "1080p"; }
@@ -73,7 +74,7 @@ function combinedLabel(st) { return [st.title, st.name, st.description].filter(B
 // Try to read seeders; also attempt a light regex parse from text if needed
 function extractSeeders(st) {
   if (typeof st.seeders === "number") return st.seeders;
-  if (typeof st.seeds === "number")   return st.seeds;
+  if (typeof st.seeds === "number") return st.seeds;
   const text = combinedLabel(st);
   const m =
     /\b(\d{2,6})\s*(?:seed(?:ers)?|seeds|s:|se:)/i.exec(text) ||
@@ -85,8 +86,8 @@ function extractSeeders(st) {
 function preferenceBonus(label) {
   const s = (label || "").toLowerCase();
   let bonus = 0;
-  ["webdl","webrip","blu","bluray","remux"].forEach(t => { if (s.includes(t)) bonus += 30; });
-  ["real-debrid","rd","premiumize","alldebrid","ad","pm"].forEach(t => { if (s.includes(t)) bonus += 20; });
+  ["webdl", "webrip", "blu", "bluray", "remux"].forEach(t => { if (s.includes(t)) bonus += 30; });
+  ["real-debrid", "rd", "premiumize", "alldebrid", "ad", "pm"].forEach(t => { if (s.includes(t)) bonus += 20; });
   if (s.includes("hevc") || s.includes("x265")) bonus += 10;
   return bonus;
 }
@@ -94,17 +95,29 @@ function preferenceBonus(label) {
 // Speed-aware rank: strong seeders bias so well-seeded lower quality can win
 function rankStream(st) {
   const label = combinedLabel(st);
-  const qTag  = qualityTag(label);
-  const q     = qualityScoreFromTag(qTag);
+  const qTag = qualityTag(label);
+  const q = qualityScoreFromTag(qTag);
   const seeds = extractSeeders(st);
   const speed = Math.log1p(seeds) * 200; // adjust weight here if desired
   return q + speed + preferenceBonus(label);
 }
 
+// Ensure resolvers (e.g., AllDebrid) always get a URL to hook into
+function normalizeForResolver(st) {
+  const hasUrl = typeof st.url === "string" && st.url.length > 0;
+  const hasMagnet = typeof st.magnet === "string" && st.magnet.startsWith("magnet:");
+  const url = hasUrl ? st.url : (hasMagnet ? st.magnet : st.url);
+  return {
+    ...st,
+    url, // Stremio/resolver entry point
+    behaviorHints: { ...(st.behaviorHints || {}), notWebReady: false }
+  };
+}
+
 // ── Fetch from upstreams ──────────────────────────────────────────────────────
 async function fetchFromSource(baseUrl, type, id) {
   const url = `${baseUrl}/stream/${encodeURIComponent(type)}/${encodeURIComponent(id)}.json`;
-  const res = await fetch(url, { headers: { "Accept": "application/json" } });
+  const res = await fetch(url, { headers: { Accept: "application/json" } });
   if (!res.ok) { console.error("Upstream error:", baseUrl, res.status); return []; }
   const data = await res.json();
   const list = Array.isArray(data.streams) ? data.streams : [];
@@ -131,7 +144,7 @@ async function getDisplayLabel(type, id) {
   try {
     const [imdb, sStr, eStr] = id.split(":");
     const metaUrl = `https://v3-cinemeta.strem.io/meta/${type}/${encodeURIComponent(imdb)}.json`;
-    const res = await fetch(metaUrl, { headers: { "Accept": "application/json" } });
+    const res = await fetch(metaUrl, { headers: { Accept: "application/json" } });
     if (!res.ok) throw new Error(`Cinemeta ${res.status}`);
     const data = await res.json();
     const title = data?.meta?.name || data?.meta?.title || imdb;
@@ -158,7 +171,7 @@ async function getDisplayLabel(type, id) {
 
 // ── Prefer lower quality if MUCH faster (configurable) ────────────────────────
 function isMuchFaster(lower, higher, ratioNeed, deltaNeed) {
-  const sLow  = extractSeeders(lower);
+  const sLow = extractSeeders(lower);
   const sHigh = extractSeeders(higher);
   const ratio = sHigh ? sLow / sHigh : Infinity; // if higher has 0 seeds, lower wins
   const delta = sLow - sHigh;
@@ -168,7 +181,7 @@ function isMuchFaster(lower, higher, ratioNeed, deltaNeed) {
 
 function bestOfQuality(cands, wantedTag) {
   const filtered = cands.filter(st => qualityTag(combinedLabel(st)) === wantedTag);
-  return filtered.length ? filtered.sort((a,b) => rankStream(b) - rankStream(a))[0] : null;
+  return filtered.length ? filtered.sort((a, b) => rankStream(b) - rankStream(a))[0] : null;
 }
 
 // ── Main handler ──────────────────────────────────────────────────────────────
@@ -183,19 +196,21 @@ builder.defineStreamHandler(async ({ type, id }) => {
     if (candidates.length === 0) return { streams: [] };
 
     // Initial curated pick by composite rank
-    let curated = candidates.slice().sort((a,b) => rankStream(b) - rankStream(a))[0];
+    let curated = candidates.slice().sort((a, b) => rankStream(b) - rankStream(a))[0];
 
     // Find best per bucket
     const best2160 = bestOfQuality(candidates, "2160p");
     const best1440 = bestOfQuality(candidates, "1440p");
     const best1080 = bestOfQuality(candidates, "1080p");
-    const best720  = bestOfQuality(candidates, "720p");
+    const best720 = bestOfQuality(candidates, "720p");
 
     // Debug (optional)
-    console.log("Seeds — 2160:", best2160 && extractSeeders(best2160),
-                "1440:", best1440 && extractSeeders(best1440),
-                "1080:", best1080 && extractSeeders(best1080),
-                "720:",  best720  && extractSeeders(best720));
+    console.log(
+      "Seeds — 2160:", best2160 && extractSeeders(best2160),
+      "1440:", best1440 && extractSeeders(best1440),
+      "1080:", best1080 && extractSeeders(best1080),
+      "720:", best720 && extractSeeders(best720)
+    );
 
     // ── Hierarchical “prefer lower if much faster” ────────────────────────────
     // Step A: If curated is 4K/2K, allow a MUCH-faster 1080p to take over.
@@ -217,15 +232,16 @@ builder.defineStreamHandler(async ({ type, id }) => {
     const makeCleanWithQ = (st) => {
       const qTag = qualityTag(combinedLabel(st));
       const clean = `${niceName} — ${qTag}`;
+      const normalized = normalizeForResolver(st); // ensure URL for resolver
       return {
         obj: {
-          ...st,
+          ...normalized,
           title: clean,          // row title (no WEBRip/AMZN/etc)
           name: "AutoStream",    // provider label in list
-          behaviorHints: { ...(st.behaviorHints || {}), bingeGroup: id }
+          behaviorHints: { ...(normalized.behaviorHints || {}), bingeGroup: id }
         },
         qScore: qualityScoreFromTag(qTag), // for sorting high→low
-        rank:  rankStream(st)
+        rank: rankStream(st)
       };
     };
 
@@ -242,7 +258,7 @@ builder.defineStreamHandler(async ({ type, id }) => {
     }
 
     // Sort by quality (highest first). If equal quality, sort by rank desc.
-    const sorted = out.sort((a,b) => b.qScore - a.qScore || b.rank - a.rank).map(x => x.obj);
+    const sorted = out.sort((a, b) => b.qScore - a.qScore || b.rank - a.rank).map(x => x.obj);
 
     return { streams: sorted };
   } catch (err) {
