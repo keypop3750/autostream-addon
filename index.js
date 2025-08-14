@@ -40,7 +40,8 @@ const manifest = {
   catalogs: [],
   idPrefixes: ["tt"],
   // 👇 Use the RAW GitHub URL (must end with .png)
-  logo: "https://github.com/keypop3750/autostream-addon/blob/b7c9352666d6241456d8b5a1b69d2b649b06c558/logo.png"
+  logo: "https://raw.githubusercontent.com/keypop3750/autostream-addon/main/logo.png
+"
 };
 const builder = new addonBuilder(manifest);
 
