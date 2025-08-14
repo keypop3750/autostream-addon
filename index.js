@@ -1,5 +1,6 @@
 // index.js
-const { addonBuilder, serveHTTP } = require("stremio-addon-sdk");
+const { addonBuilder } = require("stremio-addon-sdk");
+const express = require("express");
 const fs = require("fs");
 const path = require("path");
 
@@ -28,7 +29,7 @@ const PREF = Object.assign(
 // ── Manifest ──────────────────────────────────────────────────────────────────
 const manifest = {
   id: "org.autostream.best",
-  version: "1.5.2",
+  version: "1.6.0",
   name: "AutoStream",
   description:
     "AutoStream picks the best stream for each title, balancing quality with speed (seeders). If a lower resolution like 1080p or 720p is much faster than 4K/2K, it’s preferred for smoother playback. You’ll usually see one link; when helpful, a second 1080p option appears. Titles are neat (e.g., “Movie Name — 1080p”).",
@@ -102,14 +103,28 @@ function rankStream(st) {
   return q + speed + preferenceBonus(label);
 }
 
-// Ensure resolvers (e.g., AllDebrid) always get a URL to hook into
+// Prefer magnets so resolvers (e.g., AllDebrid) can catch them
+const COMMON_TRACKERS = [
+  "udp://tracker.opentrackr.org:1337/announce",
+  "udp://open.stealth.si:80/announce",
+  "udp://tracker.torrent.eu.org:451/announce"
+];
+function buildMagnet(st) {
+  if (typeof st.magnet === "string" && st.magnet.startsWith("magnet:")) return st.magnet;
+  const infoHash = st.infoHash || st.infohash || st.hash;
+  if (!infoHash) return null;
+  const dn = encodeURIComponent((st.title || st.name || "AutoStream").replace(/\s+/g, " "));
+  const tr = COMMON_TRACKERS.map(t => "&tr=" + encodeURIComponent(t)).join("");
+  return `magnet:?xt=urn:btih:${infoHash}&dn=${dn}${tr}`;
+}
 function normalizeForResolver(st) {
-  const hasUrl = typeof st.url === "string" && st.url.length > 0;
-  const hasMagnet = typeof st.magnet === "string" && st.magnet.startsWith("magnet:");
-  const url = hasUrl ? st.url : (hasMagnet ? st.magnet : st.url);
+  // Prefer magnet; if only infoHash present, build one; else fall back to given url
+  const magnet = buildMagnet(st);
+  const url = magnet || st.url || st.externalUrl || null;
   return {
     ...st,
-    url, // Stremio/resolver entry point
+    url,                         // resolvers look here
+    magnet: magnet || st.magnet, // keep magnet field too
     behaviorHints: { ...(st.behaviorHints || {}), notWebReady: false }
   };
 }
@@ -169,6 +184,25 @@ async function getDisplayLabel(type, id) {
   }
 }
 
+// ── Per-user config via base64url token (stateless) ───────────────────────────
+const b64u = {
+  enc: (obj) => Buffer.from(JSON.stringify(obj)).toString("base64url"),
+  dec: (str) => JSON.parse(Buffer.from(String(str || ""), "base64url").toString("utf8"))
+};
+
+// Merge per-request sources (cfg first, then defaults)
+function resolveSources(extra) {
+  try {
+    if (extra && extra.cfg) {
+      const cfg = b64u.dec(extra.cfg);
+      if (cfg && typeof cfg.torrentio === "string" && /^https?:\/\//i.test(cfg.torrentio)) {
+        return [cfg.torrentio, ...SOURCES];
+      }
+    }
+  } catch (_) {}
+  return SOURCES;
+}
+
 // ── Prefer lower quality if MUCH faster (configurable) ────────────────────────
 function isMuchFaster(lower, higher, ratioNeed, deltaNeed) {
   const sLow = extractSeeders(lower);
@@ -185,10 +219,10 @@ function bestOfQuality(cands, wantedTag) {
 }
 
 // ── Main handler ──────────────────────────────────────────────────────────────
-builder.defineStreamHandler(async ({ type, id }) => {
+builder.defineStreamHandler(async ({ type, id, extra }) => {
   try {
-    // Collect from primary then fallback
-    let candidates = await collectStreams(SOURCES, type, id);
+    // Use per-user sources (cfg) if present; else defaults
+    let candidates = await collectStreams(resolveSources(extra), type, id);
     if (candidates.length === 0) {
       console.log("No primary results; trying fallback sources …");
       candidates = await collectStreams(FALLBACK_SOURCES, type, id);
@@ -202,7 +236,7 @@ builder.defineStreamHandler(async ({ type, id }) => {
     const best2160 = bestOfQuality(candidates, "2160p");
     const best1440 = bestOfQuality(candidates, "1440p");
     const best1080 = bestOfQuality(candidates, "1080p");
-    const best720 = bestOfQuality(candidates, "720p");
+    const best720  = bestOfQuality(candidates, "720p");
 
     // Debug (optional)
     console.log(
@@ -232,15 +266,15 @@ builder.defineStreamHandler(async ({ type, id }) => {
     const makeCleanWithQ = (st) => {
       const qTag = qualityTag(combinedLabel(st));
       const clean = `${niceName} — ${qTag}`;
-      const normalized = normalizeForResolver(st); // ensure URL for resolver
+      const normalized = normalizeForResolver(st); // ensure resolvers see a URL (prefer magnet)
       return {
         obj: {
           ...normalized,
-          title: clean,          // row title (no WEBRip/AMZN/etc)
-          name: "AutoStream",    // provider label in list
+          title: clean,
+          name: "AutoStream",
           behaviorHints: { ...(normalized.behaviorHints || {}), bingeGroup: id }
         },
-        qScore: qualityScoreFromTag(qTag), // for sorting high→low
+        qScore: qualityScoreFromTag(qTag),
         rank: rankStream(st)
       };
     };
@@ -267,10 +301,57 @@ builder.defineStreamHandler(async ({ type, id }) => {
   }
 });
 
-// ── Serve (cloud-friendly) ────────────────────────────────────────────────────
+// ── Serve (cloud-friendly) with config UI ─────────────────────────────────────
 const PORT = process.env.PORT || 7000;
-serveHTTP(builder.getInterface(), { port: PORT });
-console.log(`AutoStream add-on running on port ${PORT} → /manifest.json`);
-console.log("Primary sources:", SOURCES);
-console.log("Fallback sources:", FALLBACK_SOURCES);
-console.log("Lower-quality prefs:", PREF);
+const app = express();
+app.use(express.urlencoded({ extended: true }));
+
+// Configurator UI
+app.get("/", (_, res) => {
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.end(`
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  body{font-family:system-ui,Segoe UI,Helvetica,Arial;margin:2rem;max-width:720px;color:#eee;background:#0d0e16}
+  input,button{font:inherit;padding:.6rem .8rem;border-radius:.6rem;border:1px solid #333;background:#16182a;color:#eee;width:100%}
+  code{background:#16182a;padding:.2rem .4rem;border-radius:.4rem}
+  a{color:#b395ff}
+</style>
+<h1>AutoStream – Configure (optional)</h1>
+<p>Paste your <b>Torrentio (AllDebrid)</b> endpoint (from the Torrentio configurator), e.g.</p>
+<p><code>https://torrentio.strem.fun/alldebrid|cached=true&exclude=cam,ts&audio=english&sort=seeders</code></p>
+<form method="POST" action="/setup">
+  <p><input name="torrentio" placeholder="https://torrentio.strem.fun/alldebrid|cached=true&..."></p>
+  <p><button type="submit">Generate Install Link</button></p>
+</form>
+<p><small>Your personalized link encodes the URL inside <code>cfg</code>. Nothing is stored on the server. Don’t share the link if you want to keep it private.</small></p>
+  `);
+});
+
+app.post("/setup", (req, res) => {
+  const t = String(req.body.torrentio || "").trim();
+  if (!/^https?:\/\/.+/i.test(t)) {
+    res.status(400).send("Invalid URL");
+    return;
+  }
+  const cfg = b64u.enc({ torrentio: t });
+  const install = `${req.protocol}://${req.get("host")}/manifest.json?cfg=${cfg}`;
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.end(`
+<h2>Install your personalized AutoStream</h2>
+<p>In Stremio → Add-ons → <b>Install via URL</b>, paste this link:</p>
+<p><a href="${install}"><code>${install}</code></a></p>
+<p><small>Keep this URL if you want to reinstall later.</small></p>
+  `);
+});
+
+// Mount the Stremio addon interface
+app.use("/", builder.getInterface());
+
+// Start server
+app.listen(PORT, () => {
+  console.log(`AutoStream add-on running on port ${PORT} → /manifest.json`);
+  console.log("Primary sources:", SOURCES);
+  console.log("Fallback sources:", FALLBACK_SOURCES);
+  console.log("Lower-quality prefs:", PREF);
+});
