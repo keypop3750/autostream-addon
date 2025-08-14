@@ -28,20 +28,14 @@ const PREF = Object.assign(
 // ── Manifest ──────────────────────────────────────────────────────────────────
 const manifest = {
   id: "org.autostream.best",
-  version: "1.5.0",
+  version: "1.5.1",
   name: "AutoStream",
-  description:
-    "AutoStream picks the best stream for each title, "\
-    + "balancing quality with speed (seeders). If a lower resolution like 1080p or 720p is much faster than 4K, "\
-    + "it’ll prefer that for smoother playback. You’ll usually see one link; when helpful, a second 1080p option appears. "\
-    + "Titles are clean (e.g., “Movie Name — 1080p”).",
+  description: `AutoStream picks the best stream for each title, balancing quality with speed (seeders). If a lower resolution like 1080p or 720p is much faster than 4K/2K, it’s preferred for smoother playback. You’ll usually see one link; when helpful, a second 1080p option appears. Titles are neat (e.g., “Movie Name — 1080p”).`,
   resources: ["stream"],
   types: ["movie", "series"],
   catalogs: [],
   idPrefixes: ["tt"],
-  // 👇 Use the RAW GitHub URL (must end with .png)
-  logo: "https://raw.githubusercontent.com/keypop3750/autostream-addon/main/logo.png
-"
+  logo: "https://raw.githubusercontent.com/keypop3750/autostream-addon/main/logo.png"
 };
 const builder = new addonBuilder(manifest);
 
