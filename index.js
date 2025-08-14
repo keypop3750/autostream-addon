@@ -29,7 +29,7 @@ const PREF = Object.assign(
 // ── Manifest ──────────────────────────────────────────────────────────────────
 const manifest = {
   id: "org.autostream.best",
-  version: "1.6.0",
+  version: "1.6.1",
   name: "AutoStream",
   description:
     "AutoStream picks the best stream for each title, balancing quality with speed (seeders). If a lower resolution like 1080p or 720p is much faster than 4K/2K, it’s preferred for smoother playback. You’ll usually see one link; when helpful, a second 1080p option appears. Titles are neat (e.g., “Movie Name — 1080p”).",
@@ -87,8 +87,8 @@ function extractSeeders(st) {
 function preferenceBonus(label) {
   const s = (label || "").toLowerCase();
   let bonus = 0;
-  ["webdl", "webrip", "blu", "bluray", "remux"].forEach(t => { if (s.includes(t)) bonus += 30; });
-  ["real-debrid", "rd", "premiumize", "alldebrid", "ad", "pm"].forEach(t => { if (s.includes(t)) bonus += 20; });
+  ["webdl","webrip","blu","bluray","remux"].forEach(t => { if (s.includes(t)) bonus += 30; });
+  ["real-debrid","rd","premiumize","alldebrid","ad","pm"].forEach(t => { if (s.includes(t)) bonus += 20; });
   if (s.includes("hevc") || s.includes("x265")) bonus += 10;
   return bonus;
 }
@@ -96,14 +96,14 @@ function preferenceBonus(label) {
 // Speed-aware rank: strong seeders bias so well-seeded lower quality can win
 function rankStream(st) {
   const label = combinedLabel(st);
-  const qTag = qualityTag(label);
-  const q = qualityScoreFromTag(qTag);
+  const qTag  = qualityTag(label);
+  const q     = qualityScoreFromTag(qTag);
   const seeds = extractSeeders(st);
   const speed = Math.log1p(seeds) * 200; // adjust weight here if desired
   return q + speed + preferenceBonus(label);
 }
 
-// Prefer magnets so resolvers (e.g., AllDebrid) can catch them
+// Prefer magnets so resolvers (e.g., Debrid) can catch them
 const COMMON_TRACKERS = [
   "udp://tracker.opentrackr.org:1337/announce",
   "udp://open.stealth.si:80/announce",
@@ -118,13 +118,12 @@ function buildMagnet(st) {
   return `magnet:?xt=urn:btih:${infoHash}&dn=${dn}${tr}`;
 }
 function normalizeForResolver(st) {
-  // Prefer magnet; if only infoHash present, build one; else fall back to given url
   const magnet = buildMagnet(st);
   const url = magnet || st.url || st.externalUrl || null;
   return {
     ...st,
-    url,                         // resolvers look here
-    magnet: magnet || st.magnet, // keep magnet field too
+    url,
+    magnet: magnet || st.magnet,
     behaviorHints: { ...(st.behaviorHints || {}), notWebReady: false }
   };
 }
@@ -190,6 +189,11 @@ const b64u = {
   dec: (str) => JSON.parse(Buffer.from(String(str || ""), "base64url").toString("utf8"))
 };
 
+// Detect debrid endpoints in source URLs
+function isDebridEndpoint(u) {
+  return /alldebrid|real-?debrid|premiumize/i.test(String(u || ""));
+}
+
 // Merge per-request sources (cfg first, then defaults)
 function resolveSources(extra) {
   try {
@@ -204,15 +208,14 @@ function resolveSources(extra) {
 }
 
 // ── Prefer lower quality if MUCH faster (configurable) ────────────────────────
-function isMuchFaster(lower, higher, ratioNeed, deltaNeed) {
-  const sLow = extractSeeders(lower);
+function isMuchFaster(lower, higher, ratioNeed, deltaNeed, rule = PREF.prefer_rule) {
+  const sLow  = extractSeeders(lower);
   const sHigh = extractSeeders(higher);
   const ratio = sHigh ? sLow / sHigh : Infinity; // if higher has 0 seeds, lower wins
   const delta = sLow - sHigh;
-  if (PREF.prefer_rule === "ratio_or_delta") return ratio >= ratioNeed || delta >= deltaNeed;
+  if (rule === "ratio_or_delta") return ratio >= ratioNeed || delta >= deltaNeed;
   return ratio >= ratioNeed && delta >= deltaNeed; // default: both
 }
-
 function bestOfQuality(cands, wantedTag) {
   const filtered = cands.filter(st => qualityTag(combinedLabel(st)) === wantedTag);
   return filtered.length ? filtered.sort((a, b) => rankStream(b) - rankStream(a))[0] : null;
@@ -221,13 +224,24 @@ function bestOfQuality(cands, wantedTag) {
 // ── Main handler ──────────────────────────────────────────────────────────────
 builder.defineStreamHandler(async ({ type, id, extra }) => {
   try {
-    // Use per-user sources (cfg) if present; else defaults
-    let candidates = await collectStreams(resolveSources(extra), type, id);
+    // Resolve sources for this request (cfg → defaults)
+    const usedSources = resolveSources(extra);
+    let candidates = await collectStreams(usedSources, type, id);
     if (candidates.length === 0) {
       console.log("No primary results; trying fallback sources …");
       candidates = await collectStreams(FALLBACK_SOURCES, type, id);
     }
     if (candidates.length === 0) return { streams: [] };
+
+    // Adjust thresholds if using a debrid endpoint (keep 4K/2K more often)
+    const debridPreferred = usedSources.some(isDebridEndpoint);
+    const localPref = { ...PREF };
+    if (debridPreferred) {
+      // Make it harder for 1080p to replace 4K/2K:
+      localPref.prefer1080_ratio = Math.max(localPref.prefer1080_ratio, 2.5);
+      localPref.prefer1080_delta = Math.max(localPref.prefer1080_delta, 150);
+      // leave 720p logic as-is
+    }
 
     // Initial curated pick by composite rank
     let curated = candidates.slice().sort((a, b) => rankStream(b) - rankStream(a))[0];
@@ -243,21 +257,22 @@ builder.defineStreamHandler(async ({ type, id, extra }) => {
       "Seeds — 2160:", best2160 && extractSeeders(best2160),
       "1440:", best1440 && extractSeeders(best1440),
       "1080:", best1080 && extractSeeders(best1080),
-      "720:", best720 && extractSeeders(best720)
+      "720:", best720 && extractSeeders(best720),
+      "DebridPreferred:", debridPreferred
     );
 
     // ── Hierarchical “prefer lower if much faster” ────────────────────────────
-    // Step A: If curated is 4K/2K, allow a MUCH-faster 1080p to take over.
+    // Step A: If curated is 4K/2K, only switch to 1080p if it's MUCH faster.
     const curTagA = qualityTag(combinedLabel(curated));
     if ((curTagA === "2160p" || curTagA === "1440p") && best1080 &&
-        isMuchFaster(best1080, curated, PREF.prefer1080_ratio, PREF.prefer1080_delta)) {
+        isMuchFaster(best1080, curated, localPref.prefer1080_ratio, localPref.prefer1080_delta, localPref.prefer_rule)) {
       curated = best1080;
     }
 
     // Step B: Only if curated is 1080p, allow a MUCH-faster 720p to take over.
     const curTagB = qualityTag(combinedLabel(curated));
     if (curTagB === "1080p" && best720 &&
-        isMuchFaster(best720, curated, PREF.prefer720_ratio, PREF.prefer720_delta)) {
+        isMuchFaster(best720, curated, localPref.prefer720_ratio, localPref.prefer720_delta, localPref.prefer_rule)) {
       curated = best720;
     }
 
@@ -266,7 +281,7 @@ builder.defineStreamHandler(async ({ type, id, extra }) => {
     const makeCleanWithQ = (st) => {
       const qTag = qualityTag(combinedLabel(st));
       const clean = `${niceName} — ${qTag}`;
-      const normalized = normalizeForResolver(st); // ensure resolvers see a URL (prefer magnet)
+      const normalized = normalizeForResolver(st); // prefer magnet
       return {
         obj: {
           ...normalized,
@@ -318,7 +333,7 @@ app.get("/", (_, res) => {
   a{color:#b395ff}
 </style>
 <h1>AutoStream – Configure (optional)</h1>
-<p>Paste your <b>Torrentio (AllDebrid)</b> endpoint (from the Torrentio configurator), e.g.</p>
+<p>Paste your <b>Torrentio (Debrid)</b> endpoint (from the Torrentio configurator), e.g.</p>
 <p><code>https://torrentio.strem.fun/alldebrid|cached=true&exclude=cam,ts&audio=english&sort=seeders</code></p>
 <form method="POST" action="/setup">
   <p><input name="torrentio" placeholder="https://torrentio.strem.fun/alldebrid|cached=true&..."></p>
