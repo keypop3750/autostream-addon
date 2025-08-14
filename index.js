@@ -31,16 +31,16 @@ const manifest = {
   version: "1.5.0",
   name: "AutoStream",
   description:
-    "Always shows clean, simple links that just work. AutoStream picks the best stream for each title, "\
+    "AutoStream picks the best stream for each title, "\
     + "balancing quality with speed (seeders). If a lower resolution like 1080p or 720p is much faster than 4K, "\
     + "it’ll prefer that for smoother playback. You’ll usually see one link; when helpful, a second 1080p option appears. "\
-    + "Titles are neat (e.g., “Movie Name — 1080p”).",
+    + "Titles are clean (e.g., “Movie Name — 1080p”).",
   resources: ["stream"],
   types: ["movie", "series"],
   catalogs: [],
   idPrefixes: ["tt"],
   // 👇 Use the RAW GitHub URL (must end with .png)
-  logo: "https://raw.githubusercontent.com/keypop3750/autostream-addon/main/logo.png"
+  logo: "https://github.com/keypop3750/autostream-addon/blob/b7c9352666d6241456d8b5a1b69d2b649b06c558/logo.png"
 };
 const builder = new addonBuilder(manifest);
 
