@@ -27,16 +27,21 @@ const PREF = Object.assign(
 
 // ── Manifest ──────────────────────────────────────────────────────────────────
 const manifest = {
-  id: "org.autostream.best",
-  version: "1.5.1",
-  name: "AutoStream",
-  description: `AutoStream picks the best stream for each title, balancing quality with speed (seeders). If a lower resolution like 1080p or 720p is much faster than 4K/2K, it’s preferred for smoother playback. You’ll usually see one link; when helpful, a second 1080p option appears. Titles are neat (e.g., “Movie Name — 1080p”).`,
-  resources: ["stream"],
-  types: ["movie", "series"],
-  catalogs: [],
-  idPrefixes: ["tt"],
-  logo: "https://raw.githubusercontent.com/keypop3750/autostream-addon/main/logo.png"
-};
+  "id": "org.autostream.best",
+  "version": "1.5.1",
+  "name": "AutoStream",
+  "description": "AutoStream picks the best stream for each title, balancing quality with speed (seeders). If a lower resolution like 1080p or 720p is much faster than 4K/2K, it’s preferred for smoother playback. You’ll usually see one link; when helpful, a second 1080p option appears. Titles are neat (e.g., “Movie Name — 1080p”).",
+  "resources": ["stream"],
+  "types": ["movie","series"],
+  "catalogs": [],
+  "idPrefixes": ["tt"],
+  "logo": "https://raw.githubusercontent.com/keypop3750/autostream-addon/main/logo.png",
+  "stremioAddonsConfig": {
+    "issuer": "KalPop",
+    "signature": "eyJhbGciOiJkaXIiLCJlbmMiOiJBMTI4Q0JDLUhTMjU2In0..WRaqsyZGwMKqbjeghwctLA.U7z6hT6nk7Q1F-2t77Emz4gH_aLcLrfDStKz-ueykdU5YuL83fnumwjQyi4w9hDDlpVbG8GU6Zg97oi7flPGtC1P6bFiINr2ZwZZCd15GxU1H6JORhHDXlIHSPbvnTs9.Jkd0OXurPmly8q-dHmI_eA"
+  }
+}
+
 const builder = new addonBuilder(manifest);
 
 // ── Helpers: quality / labels / seeders / ranking ────────────────────────────
