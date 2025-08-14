@@ -1,0 +1,18 @@
+{
+  "sources": [
+    "https://torrentio.strem.fun/real-debrid|only_1080p=true&only_2160p=true&exclude=cam,ts&audio=english&sort=seeders",
+    "https://thepiratebay-plus.strem.fun"
+  ],
+  "fallback_sources": [
+    "https://torrentio.strem.fun/only_720p=true&only_1080p=true&only_2160p=true&exclude=cam,ts&sort=seeders",
+    "https://thepiratebay-plus.strem.fun"
+  ],
+"prefer_lower_quality": {
+  "prefer_rule": "ratio_or_delta",
+  "prefer1080_ratio": 1.5,
+  "prefer1080_delta": 20,
+  "prefer720_ratio": 1.5,
+  "prefer720_delta": 8
+}
+
+}

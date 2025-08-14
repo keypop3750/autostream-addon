@@ -1,0 +1,12 @@
+{
+  "name": "autostream-addon",
+  "version": "1.0.0",
+  "description": "Stremio add-on that auto-picks the best stream",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "stremio-addon-sdk": "^1.6.6"
+  }
+}
