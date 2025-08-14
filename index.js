@@ -1,10 +1,10 @@
 // index.js
-const { addonBuilder } = require("stremio-addon-sdk");
+const { addonBuilder, getRouter } = require("stremio-addon-sdk");
 const express = require("express");
 const fs = require("fs");
 const path = require("path");
 
-// ── Load config ───────────────────────────────────────────────────────────────
+// ── Load config.json (defaults you ship with the addon) ───────────────────────
 let config;
 try {
   config = JSON.parse(fs.readFileSync(path.join(__dirname, "config.json"), "utf8"));
@@ -26,18 +26,58 @@ const PREF = Object.assign(
   config.prefer_lower_quality || {}
 );
 
-// ── Manifest ──────────────────────────────────────────────────────────────────
+// ── Manifest with native config (adds a Configure button in Stremio) ─────────
 const manifest = {
   id: "org.autostream.best",
-  version: "1.6.1",
+  version: "1.7.0",
   name: "AutoStream",
   description:
-    "AutoStream picks the best stream for each title, balancing quality with speed (seeders). If a lower resolution like 1080p or 720p is much faster than 4K/2K, it’s preferred for smoother playback. You’ll usually see one link; when helpful, a second 1080p option appears. Titles are neat (e.g., “Movie Name — 1080p”).",
+    "AutoStream picks the best stream for each title, balancing quality with speed (seeders). If 1080p/720p is much faster than 4K/2K, it can win for smoother playback. Usually you’ll see one link; when helpful, a second 1080p option appears. Titles are clean (e.g., “Movie Name — 1080p”).",
   resources: ["stream"],
   types: ["movie", "series"],
   catalogs: [],
   idPrefixes: ["tt"],
   logo: "https://raw.githubusercontent.com/keypop3750/autostream-addon/main/logo.png",
+
+  // Native configuration:
+  behaviorHints: {
+    configurable: true,            // shows "Configure" button
+    configurationRequired: false   // addon still works without config
+  },
+
+  // Stremio auto-generates /configure from this:
+  config: [
+    {
+      key: "debrid",
+      title: "Debrid provider",
+      type: "select",
+      options: ["none", "alldebrid", "real-debrid", "premiumize"],
+      default: "none",
+      required: false
+    },
+    {
+      key: "cached",
+      title: "Prefer cached links (Debrid)",
+      type: "checkbox",
+      default: true,
+      required: false
+    },
+    {
+      key: "params",
+      title: "Advanced Torrentio params (optional)",
+      type: "text",
+      default: "exclude=cam,ts&audio=english&sort=seeders",
+      required: false
+    },
+    {
+      key: "customSource",
+      title: "Custom source URL (optional, overrides above)",
+      type: "text",
+      required: false
+    }
+  ],
+
+  // your signed block (kept as-is)
   stremioAddonsConfig: {
     issuer: "https://stremio-addons.net",
     signature:
@@ -53,9 +93,9 @@ function qualityTag(label) {
   if (s.includes("2160") || s.includes("4k") || s.includes("uhd")) return "2160p";
   if (s.includes("1440") || s.includes("2k")) return "1440p";
   if (s.includes("1080")) return "1080p";
-  if (s.includes("720")) return "720p";
-  if (s.includes("480")) return "480p";
-  if (s.includes("cam")) return "CAM";
+  if (s.includes("720"))  return "720p";
+  if (s.includes("480"))  return "480p";
+  if (s.includes("cam"))  return "CAM";
   return "SD";
 }
 function qualityScoreFromTag(tag) {
@@ -63,10 +103,10 @@ function qualityScoreFromTag(tag) {
     case "2160p": return 4000;
     case "1440p": return 1440;
     case "1080p": return 1080;
-    case "720p": return 720;
-    case "480p": return 480;
-    case "CAM": return 10;
-    default: return 360;
+    case "720p":  return 720;
+    case "480p":  return 480;
+    case "CAM":   return 10;
+    default:      return 360;
   }
 }
 function is1080pLabel(label) { return qualityTag(label) === "1080p"; }
@@ -75,7 +115,7 @@ function combinedLabel(st) { return [st.title, st.name, st.description].filter(B
 // Try to read seeders; also attempt a light regex parse from text if needed
 function extractSeeders(st) {
   if (typeof st.seeders === "number") return st.seeders;
-  if (typeof st.seeds === "number") return st.seeds;
+  if (typeof st.seeds === "number")   return st.seeds;
   const text = combinedLabel(st);
   const m =
     /\b(\d{2,6})\s*(?:seed(?:ers)?|seeds|s:|se:)/i.exec(text) ||
@@ -99,7 +139,7 @@ function rankStream(st) {
   const qTag  = qualityTag(label);
   const q     = qualityScoreFromTag(qTag);
   const seeds = extractSeeders(st);
-  const speed = Math.log1p(seeds) * 200; // adjust weight here if desired
+  const speed = Math.log1p(seeds) * 200; // tweak if needed
   return q + speed + preferenceBonus(label);
 }
 
@@ -128,7 +168,7 @@ function normalizeForResolver(st) {
   };
 }
 
-// ── Fetch from upstreams ──────────────────────────────────────────────────────
+// ── Upstreams ────────────────────────────────────────────────────────────────
 async function fetchFromSource(baseUrl, type, id) {
   const url = `${baseUrl}/stream/${encodeURIComponent(type)}/${encodeURIComponent(id)}.json`;
   const res = await fetch(url, { headers: { Accept: "application/json" } });
@@ -183,28 +223,26 @@ async function getDisplayLabel(type, id) {
   }
 }
 
-// ── Per-user config via base64url token (stateless) ───────────────────────────
-const b64u = {
-  enc: (obj) => Buffer.from(JSON.stringify(obj)).toString("base64url"),
-  dec: (str) => JSON.parse(Buffer.from(String(str || ""), "base64url").toString("utf8"))
-};
-
-// Detect debrid endpoints in source URLs
+// ── Helpers for user config → sources ────────────────────────────────────────
 function isDebridEndpoint(u) {
   return /alldebrid|real-?debrid|premiumize/i.test(String(u || ""));
 }
-
-// Merge per-request sources (cfg first, then defaults)
-function resolveSources(extra) {
-  try {
-    if (extra && extra.cfg) {
-      const cfg = b64u.dec(extra.cfg);
-      if (cfg && typeof cfg.torrentio === "string" && /^https?:\/\//i.test(cfg.torrentio)) {
-        return [cfg.torrentio, ...SOURCES];
-      }
-    }
-  } catch (_) {}
-  return SOURCES;
+function sourcesFromUserConfig(cfg) {
+  const list = [...SOURCES];
+  const custom = (cfg && typeof cfg.customSource === "string" && cfg.customSource.trim()) || "";
+  if (custom && /^https?:\/\//i.test(custom)) {
+    // user-provided full endpoint wins
+    list.unshift(custom.trim());
+    return list;
+  }
+  const debrid = (cfg?.debrid || "none").toLowerCase();
+  if (debrid !== "none") {
+    const params = String(cfg?.params || "exclude=cam,ts&audio=english&sort=seeders").replace(/^\|/, "");
+    const cached = cfg?.cached ? "cached=true&" : "";
+    const ti = `https://torrentio.strem.fun/${debrid}|${cached}${params}`;
+    list.unshift(ti);
+  }
+  return list;
 }
 
 // ── Prefer lower quality if MUCH faster (configurable) ────────────────────────
@@ -214,7 +252,7 @@ function isMuchFaster(lower, higher, ratioNeed, deltaNeed, rule = PREF.prefer_ru
   const ratio = sHigh ? sLow / sHigh : Infinity; // if higher has 0 seeds, lower wins
   const delta = sLow - sHigh;
   if (rule === "ratio_or_delta") return ratio >= ratioNeed || delta >= deltaNeed;
-  return ratio >= ratioNeed && delta >= deltaNeed; // default: both
+  return ratio >= ratioNeed && delta >= deltaNeed;
 }
 function bestOfQuality(cands, wantedTag) {
   const filtered = cands.filter(st => qualityTag(combinedLabel(st)) === wantedTag);
@@ -222,10 +260,10 @@ function bestOfQuality(cands, wantedTag) {
 }
 
 // ── Main handler ──────────────────────────────────────────────────────────────
-builder.defineStreamHandler(async ({ type, id, extra }) => {
+builder.defineStreamHandler(async ({ type, id, config: userCfg }) => {
   try {
-    // Resolve sources for this request (cfg → defaults)
-    const usedSources = resolveSources(extra);
+    // Build sources from user's native config (if any)
+    const usedSources = sourcesFromUserConfig(userCfg || {});
     let candidates = await collectStreams(usedSources, type, id);
     if (candidates.length === 0) {
       console.log("No primary results; trying fallback sources …");
@@ -233,14 +271,14 @@ builder.defineStreamHandler(async ({ type, id, extra }) => {
     }
     if (candidates.length === 0) return { streams: [] };
 
-    // Adjust thresholds if using a debrid endpoint (keep 4K/2K more often)
-    const debridPreferred = usedSources.some(isDebridEndpoint);
+    // If user selected a Debrid preset, bias toward 4K/2K (harder for 1080p to replace)
+    const debridPreferred = usedSources.some(isDebridEndpoint) || ((userCfg?.debrid || "none") !== "none");
     const localPref = { ...PREF };
     if (debridPreferred) {
-      // Make it harder for 1080p to replace 4K/2K:
+      // Keep high-res more often when Debrid is in play:
       localPref.prefer1080_ratio = Math.max(localPref.prefer1080_ratio, 3.5);
       localPref.prefer1080_delta = Math.max(localPref.prefer1080_delta, 1000);
-      // leave 720p logic as-is
+      // 720p rule unchanged
     }
 
     // Initial curated pick by composite rank
@@ -257,22 +295,19 @@ builder.defineStreamHandler(async ({ type, id, extra }) => {
       "Seeds — 2160:", best2160 && extractSeeders(best2160),
       "1440:", best1440 && extractSeeders(best1440),
       "1080:", best1080 && extractSeeders(best1080),
-      "720:", best720 && extractSeeders(best720),
+      "720:",  best720  && extractSeeders(best720),
       "DebridPreferred:", debridPreferred
     );
 
-    // ── Hierarchical “prefer lower if much faster” ────────────────────────────
-    // Step A: If curated is 4K/2K, only switch to 1080p if it's MUCH faster.
+    // Hierarchical “prefer lower if MUCH faster”
     const curTagA = qualityTag(combinedLabel(curated));
     if ((curTagA === "2160p" || curTagA === "1440p") && best1080 &&
         isMuchFaster(best1080, curated, localPref.prefer1080_ratio, localPref.prefer1080_delta, localPref.prefer_rule)) {
       curated = best1080;
     }
-
-    // Step B: Only if curated is 1080p, allow a MUCH-faster 720p to take over.
     const curTagB = qualityTag(combinedLabel(curated));
     if (curTagB === "1080p" && best720 &&
-        (best720, curated, localPref.prefer720_ratio, localPref.prefer720_delta, localPref.prefer_rule)) {
+        isMuchFaster(best720, curated, localPref.prefer720_ratio, localPref.prefer720_delta, localPref.prefer_rule)) {
       curated = best720;
     }
 
@@ -316,61 +351,15 @@ builder.defineStreamHandler(async ({ type, id, extra }) => {
   }
 });
 
-// ── Serve (cloud-friendly) with config UI ─────────────────────────────────────
+// ── Serve with Express Router provided by SDK (includes /configure) ──────────
 const PORT = process.env.PORT || 7000;
 const app = express();
-app.use(express.urlencoded({ extended: true }));
+const router = getRouter(builder.getInterface());
+app.use(router);
 
-// Configurator UI
-app.get("/", (_, res) => {
-  res.setHeader("Content-Type", "text/html; charset=utf-8");
-  res.end(`
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<style>
-  body{font-family:system-ui,Segoe UI,Helvetica,Arial;margin:2rem;max-width:720px;color:#eee;background:#0d0e16}
-  input,button{font:inherit;padding:.6rem .8rem;border-radius:.6rem;border:1px solid #333;background:#16182a;color:#eee;width:100%}
-  code{background:#16182a;padding:.2rem .4rem;border-radius:.4rem}
-  a{color:#b395ff}
-</style>
-<h1>AutoStream – Configure (optional)</h1>
-<p>Paste your <b>Torrentio (Debrid)</b> endpoint (from the Torrentio configurator), e.g.</p>
-<p><code>https://torrentio.strem.fun/alldebrid|cached=true&exclude=cam,ts&audio=english&sort=seeders</code></p>
-<form method="POST" action="/setup">
-  <p><input name="torrentio" placeholder="https://torrentio.strem.fun/alldebrid|cached=true&..."></p>
-  <p><button type="submit">Generate Install Link</button></p>
-</form>
-<p><small>Your personalized link encodes the URL inside <code>cfg</code>. Nothing is stored on the server. Don’t share the link if you want to keep it private.</small></p>
-  `);
-});
-
-app.post("/setup", (req, res) => {
-  const t = String(req.body.torrentio || "").trim();
-  if (!/^https?:\/\/.+/i.test(t)) {
-    res.status(400).send("Invalid URL");
-    return;
-  }
-  const cfg = b64u.enc({ torrentio: t });
-  const install = `${req.protocol}://${req.get("host")}/manifest.json?cfg=${cfg}`;
-  res.setHeader("Content-Type", "text/html; charset=utf-8");
-  res.end(`
-<h2>Install your personalized AutoStream</h2>
-<p>In Stremio → Add-ons → <b>Install via URL</b>, paste this link:</p>
-<p><a href="${install}"><code>${install}</code></a></p>
-<p><small>Keep this URL if you want to reinstall later.</small></p>
-  `);
-});
-
-// Mount the Stremio addon interface
-const { getRouter } = require("stremio-addon-sdk");
-const addonRouter = getRouter(builder.getInterface());
-app.use(addonRouter);
-
-
-
-// Start server
 app.listen(PORT, () => {
   console.log(`AutoStream add-on running on port ${PORT} → /manifest.json`);
   console.log("Primary sources:", SOURCES);
   console.log("Fallback sources:", FALLBACK_SOURCES);
-  console.log("Lower-quality prefs:", PREF);
+  console.log("Lower-quality prefs (base):", PREF);
 });
