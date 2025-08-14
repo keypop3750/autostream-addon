@@ -238,8 +238,8 @@ builder.defineStreamHandler(async ({ type, id, extra }) => {
     const localPref = { ...PREF };
     if (debridPreferred) {
       // Make it harder for 1080p to replace 4K/2K:
-      localPref.prefer1080_ratio = Math.max(localPref.prefer1080_ratio, 2.5);
-      localPref.prefer1080_delta = Math.max(localPref.prefer1080_delta, 150);
+      localPref.prefer1080_ratio = Math.max(localPref.prefer1080_ratio, 3.5);
+      localPref.prefer1080_delta = Math.max(localPref.prefer1080_delta, 1000);
       // leave 720p logic as-is
     }
 
@@ -361,11 +361,10 @@ app.post("/setup", (req, res) => {
 });
 
 // Mount the Stremio addon interface
-const addonInterface = builder.getInterface();
+const { getRouter } = require("stremio-addon-sdk");
+const addonRouter = getRouter(builder.getInterface());
+app.use(addonRouter);
 
-app.get("/manifest.json", addonInterface.manifest);
-app.get("/stream/:type/:id.json", addonInterface.get);
-app.post("/stream/:type/:id.json", addonInterface.post);
 
 
 // Start server
