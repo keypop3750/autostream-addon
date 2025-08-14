@@ -272,7 +272,7 @@ builder.defineStreamHandler(async ({ type, id, extra }) => {
     // Step B: Only if curated is 1080p, allow a MUCH-faster 720p to take over.
     const curTagB = qualityTag(combinedLabel(curated));
     if (curTagB === "1080p" && best720 &&
-        isMuchFaster(best720, curated, localPref.prefer720_ratio, localPref.prefer720_delta, localPref.prefer_rule)) {
+        (best720, curated, localPref.prefer720_ratio, localPref.prefer720_delta, localPref.prefer_rule)) {
       curated = best720;
     }
 
@@ -361,7 +361,12 @@ app.post("/setup", (req, res) => {
 });
 
 // Mount the Stremio addon interface
-app.use("/", builder.getInterface());
+const addonInterface = builder.getInterface();
+
+app.get("/manifest.json", addonInterface.manifest);
+app.get("/stream/:type/:id.json", addonInterface.get);
+app.post("/stream/:type/:id.json", addonInterface.post);
+
 
 // Start server
 app.listen(PORT, () => {
