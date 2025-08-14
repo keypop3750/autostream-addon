@@ -4,7 +4,7 @@ const express = require("express");
 const fs = require("fs");
 const path = require("path");
 
-// ── Load config.json (defaults you ship with the addon) ───────────────────────
+// ── Load server defaults from config.json ─────────────────────────────────────
 let config;
 try {
   config = JSON.parse(fs.readFileSync(path.join(__dirname, "config.json"), "utf8"));
@@ -26,26 +26,25 @@ const PREF = Object.assign(
   config.prefer_lower_quality || {}
 );
 
-// ── Manifest with native config (adds a Configure button in Stremio) ─────────
+// ── Manifest with native config ───────────────────────────────────────────────
 const manifest = {
   id: "org.autostream.best",
-  version: "1.7.0",
+  version: "1.7.1",
   name: "AutoStream",
   description:
-    "AutoStream picks the best stream for each title, balancing quality with speed (seeders). If 1080p/720p is much faster than 4K/2K, it can win for smoother playback. Usually you’ll see one link; when helpful, a second 1080p option appears. Titles are clean (e.g., “Movie Name — 1080p”).",
+    "AutoStream picks the best stream for each title, balancing quality with speed (seeders). If 1080p/720p is much faster than 4K/2K, it can win for smoother playback. Usually one link; when helpful, a second 1080p option appears. Titles are clean (e.g., “Movie — 1080p”).",
   resources: ["stream"],
   types: ["movie", "series"],
   catalogs: [],
   idPrefixes: ["tt"],
   logo: "https://raw.githubusercontent.com/keypop3750/autostream-addon/main/logo.png",
 
-  // Native configuration:
   behaviorHints: {
-    configurable: true,            // shows "Configure" button
-    configurationRequired: false   // addon still works without config
+    configurable: true,
+    configurationRequired: false
   },
 
-  // Stremio auto-generates /configure from this:
+  // Shown in Stremio's Configure UI
   config: [
     {
       key: "debrid",
@@ -77,7 +76,6 @@ const manifest = {
     }
   ],
 
-  // your signed block (kept as-is)
   stremioAddonsConfig: {
     issuer: "https://stremio-addons.net",
     signature:
@@ -87,7 +85,7 @@ const manifest = {
 
 const builder = new addonBuilder(manifest);
 
-// ── Helpers: quality / labels / seeders / ranking ────────────────────────────
+// ── Helpers: quality / seeders / ranking ─────────────────────────────────────
 function qualityTag(label) {
   const s = (label || "").toLowerCase();
   if (s.includes("2160") || s.includes("4k") || s.includes("uhd")) return "2160p";
@@ -97,6 +95,11 @@ function qualityTag(label) {
   if (s.includes("480"))  return "480p";
   if (s.includes("cam"))  return "CAM";
   return "SD";
+}
+function displayQuality(tag) {
+  if (tag === "2160p") return "4K";
+  if (tag === "1440p") return "2K";
+  return tag;
 }
 function qualityScoreFromTag(tag) {
   switch (tag) {
@@ -112,7 +115,6 @@ function qualityScoreFromTag(tag) {
 function is1080pLabel(label) { return qualityTag(label) === "1080p"; }
 function combinedLabel(st) { return [st.title, st.name, st.description].filter(Boolean).join(" "); }
 
-// Try to read seeders; also attempt a light regex parse from text if needed
 function extractSeeders(st) {
   if (typeof st.seeders === "number") return st.seeders;
   if (typeof st.seeds === "number")   return st.seeds;
@@ -123,7 +125,6 @@ function extractSeeders(st) {
     /\bseeds?\s*[:\-]?\s*(\d{2,6})\b/i.exec(text);
   return m ? parseInt(m[1], 10) : 0;
 }
-
 function preferenceBonus(label) {
   const s = (label || "").toLowerCase();
   let bonus = 0;
@@ -132,18 +133,16 @@ function preferenceBonus(label) {
   if (s.includes("hevc") || s.includes("x265")) bonus += 10;
   return bonus;
 }
-
-// Speed-aware rank: strong seeders bias so well-seeded lower quality can win
 function rankStream(st) {
   const label = combinedLabel(st);
   const qTag  = qualityTag(label);
   const q     = qualityScoreFromTag(qTag);
   const seeds = extractSeeders(st);
-  const speed = Math.log1p(seeds) * 200; // tweak if needed
+  const speed = Math.log1p(seeds) * 200;
   return q + speed + preferenceBonus(label);
 }
 
-// Prefer magnets so resolvers (e.g., Debrid) can catch them
+// Prefer magnets so debird resolvers can hook in
 const COMMON_TRACKERS = [
   "udp://tracker.opentrackr.org:1337/announce",
   "udp://open.stealth.si:80/announce",
@@ -193,7 +192,7 @@ async function collectStreams(sources, type, id) {
   return unique;
 }
 
-// ── Cinemeta nice names ───────────────────────────────────────────────────────
+// ── Cinemeta display names ───────────────────────────────────────────────────
 async function getDisplayLabel(type, id) {
   try {
     const [imdb, sStr, eStr] = id.split(":");
@@ -223,7 +222,7 @@ async function getDisplayLabel(type, id) {
   }
 }
 
-// ── Helpers for user config → sources ────────────────────────────────────────
+// ── Build sources from user's config ─────────────────────────────────────────
 function isDebridEndpoint(u) {
   return /alldebrid|real-?debrid|premiumize/i.test(String(u || ""));
 }
@@ -231,7 +230,6 @@ function sourcesFromUserConfig(cfg) {
   const list = [...SOURCES];
   const custom = (cfg && typeof cfg.customSource === "string" && cfg.customSource.trim()) || "";
   if (custom && /^https?:\/\//i.test(custom)) {
-    // user-provided full endpoint wins
     list.unshift(custom.trim());
     return list;
   }
@@ -245,11 +243,11 @@ function sourcesFromUserConfig(cfg) {
   return list;
 }
 
-// ── Prefer lower quality if MUCH faster (configurable) ────────────────────────
+// ── Prefer lower quality if MUCH faster ──────────────────────────────────────
 function isMuchFaster(lower, higher, ratioNeed, deltaNeed, rule = PREF.prefer_rule) {
   const sLow  = extractSeeders(lower);
   const sHigh = extractSeeders(higher);
-  const ratio = sHigh ? sLow / sHigh : Infinity; // if higher has 0 seeds, lower wins
+  const ratio = sHigh ? sLow / sHigh : Infinity;
   const delta = sLow - sHigh;
   if (rule === "ratio_or_delta") return ratio >= ratioNeed || delta >= deltaNeed;
   return ratio >= ratioNeed && delta >= deltaNeed;
@@ -259,10 +257,9 @@ function bestOfQuality(cands, wantedTag) {
   return filtered.length ? filtered.sort((a, b) => rankStream(b) - rankStream(a))[0] : null;
 }
 
-// ── Main handler ──────────────────────────────────────────────────────────────
+// ── Stream handler ───────────────────────────────────────────────────────────
 builder.defineStreamHandler(async ({ type, id, config: userCfg }) => {
   try {
-    // Build sources from user's native config (if any)
     const usedSources = sourcesFromUserConfig(userCfg || {});
     let candidates = await collectStreams(usedSources, type, id);
     if (candidates.length === 0) {
@@ -271,35 +268,24 @@ builder.defineStreamHandler(async ({ type, id, config: userCfg }) => {
     }
     if (candidates.length === 0) return { streams: [] };
 
-    // If user selected a Debrid preset, bias toward 4K/2K (harder for 1080p to replace)
+    // Debrid selected? keep 4K/2K more often
     const debridPreferred = usedSources.some(isDebridEndpoint) || ((userCfg?.debrid || "none") !== "none");
     const localPref = { ...PREF };
     if (debridPreferred) {
-      // Keep high-res more often when Debrid is in play:
       localPref.prefer1080_ratio = Math.max(localPref.prefer1080_ratio, 3.5);
       localPref.prefer1080_delta = Math.max(localPref.prefer1080_delta, 1000);
-      // 720p rule unchanged
     }
 
-    // Initial curated pick by composite rank
+    // Initial curated pick
     let curated = candidates.slice().sort((a, b) => rankStream(b) - rankStream(a))[0];
 
-    // Find best per bucket
+    // Best per bucket
     const best2160 = bestOfQuality(candidates, "2160p");
     const best1440 = bestOfQuality(candidates, "1440p");
     const best1080 = bestOfQuality(candidates, "1080p");
     const best720  = bestOfQuality(candidates, "720p");
 
-    // Debug (optional)
-    console.log(
-      "Seeds — 2160:", best2160 && extractSeeders(best2160),
-      "1440:", best1440 && extractSeeders(best1440),
-      "1080:", best1080 && extractSeeders(best1080),
-      "720:",  best720  && extractSeeders(best720),
-      "DebridPreferred:", debridPreferred
-    );
-
-    // Hierarchical “prefer lower if MUCH faster”
+    // Prefer lower if MUCH faster
     const curTagA = qualityTag(combinedLabel(curated));
     if ((curTagA === "2160p" || curTagA === "1440p") && best1080 &&
         isMuchFaster(best1080, curated, localPref.prefer1080_ratio, localPref.prefer1080_delta, localPref.prefer_rule)) {
@@ -311,12 +297,12 @@ builder.defineStreamHandler(async ({ type, id, config: userCfg }) => {
       curated = best720;
     }
 
-    // Build clean display title + provider label
+    // Clean titles with 4K/2K labels
     const niceName = await getDisplayLabel(type, id);
     const makeCleanWithQ = (st) => {
       const qTag = qualityTag(combinedLabel(st));
-      const clean = `${niceName} — ${qTag}`;
-      const normalized = normalizeForResolver(st); // prefer magnet
+      const clean = `${niceName} — ${displayQuality(qTag)}`;
+      const normalized = normalizeForResolver(st);
       return {
         obj: {
           ...normalized,
@@ -329,21 +315,15 @@ builder.defineStreamHandler(async ({ type, id, config: userCfg }) => {
       };
     };
 
-    // Decide which to return:
     const out = [];
-    const curatedPack = makeCleanWithQ(curated);
-    out.push(curatedPack);
-
-    // If curated isn't 1080p AND we have a best1080, include it as a second option
+    out.push(makeCleanWithQ(curated));
     if (!is1080pLabel(combinedLabel(curated)) && best1080) {
       const keyA = curated.url || curated.externalUrl || curated.magnet || curated.infoHash;
       const keyB = best1080.url || best1080.externalUrl || best1080.magnet || best1080.infoHash;
       if (!keyA || !keyB || keyA !== keyB) out.push(makeCleanWithQ(best1080));
     }
 
-    // Sort by quality (highest first). If equal quality, sort by rank desc.
     const sorted = out.sort((a, b) => b.qScore - a.qScore || b.rank - a.rank).map(x => x.obj);
-
     return { streams: sorted };
   } catch (err) {
     console.error("AutoStream error:", err);
@@ -351,11 +331,76 @@ builder.defineStreamHandler(async ({ type, id, config: userCfg }) => {
   }
 });
 
-// ── Serve with Express Router provided by SDK (includes /configure) ──────────
+// ── Web server with SDK router + our /configure page ─────────────────────────
 const PORT = process.env.PORT || 7000;
 const app = express();
-const router = getRouter(builder.getInterface());
-app.use(router);
+
+// mount SDK router (serves /manifest.json, /stream/… and handles config token)
+const sdkRouter = getRouter(builder.getInterface());
+app.use(sdkRouter);
+
+// Our own /configure page so browser GET works (Stremio Addons site opens it)
+app.use(express.urlencoded({ extended: true }));
+app.use(express.json());
+
+// Render a simple form
+app.get("/configure", (req, res) => {
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.end(`
+<!doctype html>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AutoStream — Configure</title>
+<style>
+  body{font-family:system-ui,Segoe UI,Helvetica,Arial;background:#0d0e16;color:#e6e6ec;margin:2rem}
+  label{display:block;margin:.8rem 0 .2rem}
+  input,select,button{font:inherit;padding:.6rem .8rem;border-radius:.6rem;border:1px solid #333;background:#16182a;color:#eee;width:100%}
+  button{cursor:pointer}
+  .row{display:grid;gap:.8rem}
+</style>
+<h1>AutoStream — Configure</h1>
+<form method="POST" action="/configure">
+  <label>Debrid provider</label>
+  <select name="debrid">
+    <option value="none">None</option>
+    <option value="alldebrid">AllDebrid</option>
+    <option value="real-debrid">Real-Debrid</option>
+    <option value="premiumize">Premiumize</option>
+  </select>
+
+  <label><input type="checkbox" name="cached" value="true" checked> Prefer cached links (Debrid)</label>
+
+  <label>Advanced Torrentio params (optional)</label>
+  <input name="params" value="exclude=cam,ts&audio=english&sort=seeders" placeholder="exclude=cam,ts&audio=english&sort=seeders">
+
+  <label>Custom source URL (optional, overrides above)</label>
+  <input name="customSource" placeholder="https://torrentio.strem.fun/alldebrid|cached=true&...">
+
+  <p><button type="submit">Install in Stremio</button></p>
+</form>
+  `);
+});
+
+// Accept config (form or JSON), return redirect/JSON with install URL
+app.post("/configure", (req, res) => {
+  const cfg = {
+    debrid: String(req.body.debrid || "none"),
+    cached: !!(req.body.cached && req.body.cached !== "false"),
+    params: String(req.body.params || ""),
+    customSource: String(req.body.customSource || "")
+  };
+
+  const token = Buffer.from(JSON.stringify(cfg)).toString("base64url");
+  const base = `${req.protocol}://${req.get("host")}`;
+  const installUrl = `${base}/manifest.json?config=${token}`;
+
+  // If JSON was requested (e.g. by a site), return JSON.
+  if ((req.get("accept") || "").includes("application/json")) {
+    res.json({ addonUrl: installUrl });
+    return;
+  }
+  // Otherwise 302 for a browser, which Stremio understands too.
+  res.redirect(302, installUrl);
+});
 
 app.listen(PORT, () => {
   console.log(`AutoStream add-on running on port ${PORT} → /manifest.json`);
