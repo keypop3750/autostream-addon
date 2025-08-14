@@ -29,7 +29,7 @@ const PREF = Object.assign(
 // ── Manifest ──────────────────────────────────────────────────────────────────
 const manifest = {
   id: "org.autostream.best",
-  version: "1.6.3",
+  version: "1.8.0",
   name: "AutoStream",
   description:
     "AutoStream picks the best stream for each title, balancing quality with speed (seeders). If a lower resolution like 1080p or 720p is much faster than 4K/2K, it’s preferred for smoother playback. You’ll usually see one link; when helpful, a second 1080p option appears. Titles are neat (e.g., “Movie Name — 1080p”).",
@@ -231,6 +231,7 @@ builder.defineStreamHandler(async ({ type, id, extra }) => {
     const debridPreferred = usedSources.some(isDebridEndpoint);
     const localPref = { ...PREF };
     if (debridPreferred) {
+      // keep 4K/2K more often when debrid is present
       localPref.prefer1080_ratio = Math.max(localPref.prefer1080_ratio, 3.5);
       localPref.prefer1080_delta = Math.max(localPref.prefer1080_delta, 1000);
     }
@@ -297,12 +298,12 @@ builder.defineStreamHandler(async ({ type, id, extra }) => {
   }
 });
 
-// ── Configure page ────────────────────────────────────────────────────────────
+// ── Configure page & server ───────────────────────────────────────────────────
 const PORT = process.env.PORT || 7000;
 const app = express();
 app.use(express.urlencoded({ extended: true }));
 
-// allow CORS (helps some environments)
+// Simple CORS
 app.use((_, res, next) => { res.setHeader("Access-Control-Allow-Origin", "*"); next(); });
 
 function baseOrigin(req) {
@@ -386,8 +387,9 @@ app.post("/configure", (req, res) => {
   const torrentio = buildTorrentioUrl({ provider, cached, apikey });
   const cfg = b64u.enc({ torrentio });
 
-  const origin = baseOrigin(req); // respects x-forwarded-proto (https on Render)
-  const manifestUrl = `${origin}/manifest.json?cfg=${cfg}`;
+  const origin = baseOrigin(req);
+  // IMPORTANT: put cfg in the PATH, not the query, so Stremio keeps it for all routes
+  const manifestUrl = `${origin}/u/${cfg}/manifest.json`;
   const deep = `stremio://addon-install?url=${encodeURIComponent(manifestUrl)}`;
 
   res.setHeader("Content-Type", "text/html; charset=utf-8");
@@ -416,13 +418,23 @@ app.post("/configure", (req, res) => {
   </div>`);
 });
 
-// Mount the Stremio addon interface
-const addonRouter = getRouter(builder.getInterface());
-app.use(addonRouter);
+// ---- Mount addon interface
+const iface = builder.getInterface();
+const router = getRouter(iface);
 
-// Start server
+// Plain base (no cfg)
+app.use("/", router);
+
+// Config-aware base: /u/:cfg/...
+// We inject ?cfg=... back into req.query so the SDK passes it as "extra" to stream handler.
+app.use("/u/:cfg", (req, _res, next) => {
+  req.query = Object.assign({}, req.query, { cfg: req.params.cfg });
+  next();
+}, router);
+
+const PORT = process.env.PORT || 7000;
 app.listen(PORT, () => {
-  console.log(`AutoStream add-on running on port ${PORT} → /manifest.json`);
+  console.log(`AutoStream add-on running on port ${PORT}`);
   console.log("Primary sources:", SOURCES);
   console.log("Fallback sources:", FALLBACK_SOURCES);
   console.log("Lower-quality prefs:", PREF);
