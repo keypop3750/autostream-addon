@@ -38,7 +38,7 @@ const manifest = {
   "logo": "https://raw.githubusercontent.com/keypop3750/autostream-addon/main/logo.png",
   "stremioAddonsConfig": {
     "issuer": "KalPop",
-    "signature": "eyJhbGciOiJkaXIiLCJlbmMiOiJBMTI4Q0JDLUhTMjU2In0..WRaqsyZGwMKqbjeghwctLA.U7z6hT6nk7Q1F-2t77Emz4gH_aLcLrfDStKz-ueykdU5YuL83fnumwjQyi4w9hDDlpVbG8GU6Zg97oi7flPGtC1P6bFiINr2ZwZZCd15GxU1H6JORhHDXlIHSPbvnTs9.Jkd0OXurPmly8q-dHmI_eA"
+    "signature": "eyJhbGciOiJkaXIiLCJlbmMiOiJBMTI4Q0JDLUhTMjU2In0..KPt7fOiOCod52ZjlFWg52A.dt7eIyal-1oAkU4cOG5c6YPsWn70Ds6AXqY1FJX3Ikqzzeu1gzgj2_xO4e4zh7gsXEyjhoAJ-L9Pg6UI57XD6FWjzpRcvV0v-6WuKmfZO_hDcDIrtVQnFf0nK2dnO7-n.v25_jaY5E-4yH_cxyTKfsA"
   }
 }
 
