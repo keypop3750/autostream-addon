@@ -27,20 +27,21 @@ const PREF = Object.assign(
 
 // ── Manifest ──────────────────────────────────────────────────────────────────
 const manifest = {
-  "id": "org.autostream.best",
-  "version": "1.5.1",
-  "name": "AutoStream",
-  "description": "AutoStream picks the best stream for each title, balancing quality with speed (seeders). If a lower resolution like 1080p or 720p is much faster than 4K/2K, it’s preferred for smoother playback. You’ll usually see one link; when helpful, a second 1080p option appears. Titles are neat (e.g., “Movie Name — 1080p”).",
-  "resources": ["stream"],
-  "types": ["movie","series"],
-  "catalogs": [],
-  "idPrefixes": ["tt"],
-  "logo": "https://raw.githubusercontent.com/keypop3750/autostream-addon/main/logo.png",
-  "stremioAddonsConfig": {
-    "issuer": "KalPop",
-    "signature": "eyJhbGciOiJkaXIiLCJlbmMiOiJBMTI4Q0JDLUhTMjU2In0..KPt7fOiOCod52ZjlFWg52A.dt7eIyal-1oAkU4cOG5c6YPsWn70Ds6AXqY1FJX3Ikqzzeu1gzgj2_xO4e4zh7gsXEyjhoAJ-L9Pg6UI57XD6FWjzpRcvV0v-6WuKmfZO_hDcDIrtVQnFf0nK2dnO7-n.v25_jaY5E-4yH_cxyTKfsA"
+  id: "org.autostream.best",
+  version: "1.5.1",
+  name: "AutoStream",
+  description:
+    "AutoStream picks the best stream for each title, balancing quality with speed (seeders). If a lower resolution like 1080p or 720p is much faster than 4K/2K, it’s preferred for smoother playback. You’ll usually see one link; when helpful, a second 1080p option appears. Titles are neat (e.g., “Movie Name — 1080p”).",
+  resources: ["stream"],
+  types: ["movie", "series"],
+  catalogs: [],
+  idPrefixes: ["tt"],
+  logo: "https://raw.githubusercontent.com/keypop3750/autostream-addon/main/logo.png",
+  stremioAddonsConfig: {
+    issuer: "https://stremio-addons.net",
+    signature: "eyJhbGciOiJkaXIiLCJlbmMiOiJBMTI4Q0JDLUhTMjU2In0..KPt7fOiOCod52ZjlFWg52A.dt7eIyal-1oAkU4cOG5c6YPsWn70Ds6AXqY1FJX3Ikqzzeu1gzgj2_xO4e4zh7gsXEyjhoAJ-L9Pg6UI57XD6FWjzpRcvV0v-6WuKmfZO_hDcDIrtVQnFf0nK2dnO7-n.v25_jaY5E-4yH_cxyTKfsA"
   }
-}
+};
 
 const builder = new addonBuilder(manifest);
 
