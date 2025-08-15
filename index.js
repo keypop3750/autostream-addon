@@ -4,9 +4,7 @@ const express = require("express");
 const fs = require("fs");
 const path = require("path");
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Load base config (defaults used when user hasn't configured debrid)
-// ──────────────────────────────────────────────────────────────────────────────
+// ── Load config ───────────────────────────────────────────────────────────────
 let config;
 try {
   config = JSON.parse(fs.readFileSync(path.join(__dirname, "config.json"), "utf8"));
@@ -28,12 +26,10 @@ const PREF = Object.assign(
   config.prefer_lower_quality || {}
 );
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Manifest
-// ──────────────────────────────────────────────────────────────────────────────
+// ── Manifest ──────────────────────────────────────────────────────────────────
 const manifest = {
   id: "org.autostream.best",
-  version: "1.9.0",
+  version: "1.9.1",
   name: "AutoStream",
   description:
     "AutoStream picks the best stream for each title, balancing quality with speed (seeders). If a lower resolution like 1080p or 720p is much faster than 4K/2K, it’s preferred for smoother playback. You’ll usually see one link; when helpful, a second 1080p option appears. Titles are neat (e.g., “Movie Name — 1080p”).",
@@ -49,11 +45,10 @@ const manifest = {
       "eyJhbGciOiJkaXIiLCJlbmMiOiJBMTI4Q0JDLUhTMjU2In0..KPt7fOiOCod52ZjlFWg52A.dt7eIyal-1oAkU4cOG5c6YPsWn70Ds6AXqY1FJX3Ikqzzeu1gzgj2_xO4e4zh7gsXEyjhoAJ-L9Pg6UI57XD6FWjzpRcvV0v-6WuKmfZO_hDcDIrtVQnFf0nK2dnO7-n.v25_jaY5E-4yH_cxyTKfsA"
   }
 };
+
 const builder = new addonBuilder(manifest);
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Utils: quality + seeders + ranking
-// ──────────────────────────────────────────────────────────────────────────────
+// ── Helpers: quality / labels / seeders / ranking ────────────────────────────
 function qualityTag(label) {
   const s = (label || "").toLowerCase();
   if (s.includes("2160") || s.includes("4k") || s.includes("uhd")) return "2160p";
@@ -64,11 +59,7 @@ function qualityTag(label) {
   if (s.includes("cam"))  return "CAM";
   return "SD";
 }
-function displayTag(tag) {
-  if (tag === "2160p") return "4K";
-  if (tag === "1440p") return "2K";
-  return tag;
-}
+function displayTag(tag) { return tag === "2160p" ? "4K" : tag === "1440p" ? "2K" : tag; }
 function qualityScoreFromTag(tag) {
   switch (tag) {
     case "2160p": return 4000;
@@ -82,6 +73,7 @@ function qualityScoreFromTag(tag) {
 }
 function is1080pLabel(label) { return qualityTag(label) === "1080p"; }
 function combinedLabel(st) { return [st.title, st.name, st.description].filter(Boolean).join(" "); }
+
 function extractSeeders(st) {
   if (typeof st.seeders === "number") return st.seeders;
   if (typeof st.seeds === "number")   return st.seeds;
@@ -109,57 +101,49 @@ function rankStream(st) {
   return q + speed + preferenceBonus(label);
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-const b64u = {
-  enc: (obj) => Buffer.from(JSON.stringify(obj)).toString("base64url"),
-  dec: (str) => JSON.parse(Buffer.from(String(str || ""), "base64url").toString("utf8"))
-};
-function isDebridSource(url) {
-  const s = String(url || "");
-  return /(alldebrid|real-?debrid|premiumize)/i.test(s) && /(apikey=|apiKey=)/i.test(s);
+// Prefer magnets so resolvers (e.g., Debrid) can catch them (used as fallback)
+const COMMON_TRACKERS = [
+  "udp://tracker.opentrackr.org:1337/announce",
+  "udp://open.stealth.si:80/announce",
+  "udp://tracker.torrent.eu.org:451/announce"
+];
+function buildMagnet(st) {
+  if (typeof st.magnet === "string" && st.magnet.startsWith("magnet:")) return st.magnet;
+  const infoHash = st.infoHash || st.infohash || st.hash;
+  if (!infoHash) return null;
+  const dn = encodeURIComponent((st.title || st.name || "AutoStream").replace(/\s+/g, " "));
+  const tr = COMMON_TRACKERS.map(t => "&tr=" + encodeURIComponent(t)).join("");
+  return `magnet:?xt=urn:btih:${infoHash}&dn=${dn}${tr}`;
 }
-function resolveSources(extra) {
-  try {
-    if (extra && extra.cfg) {
-      const cfg = b64u.dec(extra.cfg);
-      if (cfg && typeof cfg.torrentio === "string" && /^https?:\/\//i.test(cfg.torrentio)) {
-        return [cfg.torrentio, ...SOURCES];
-      }
-    }
-  } catch (_) {}
-  return SOURCES;
+function normalizeForResolver(st) {
+  const magnet = buildMagnet(st);
+  const url = st.url || st.externalUrl || magnet || null;
+  return {
+    ...st,
+    url,
+    magnet: magnet || st.magnet,
+    behaviorHints: { ...(st.behaviorHints || {}), notWebReady: false }
+  };
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Upstream fetch with strong debug logging
-// ──────────────────────────────────────────────────────────────────────────────
+// ── Fetch from upstreams ──────────────────────────────────────────────────────
 async function fetchFromSource(baseUrl, type, id) {
   const url = `${baseUrl}/stream/${encodeURIComponent(type)}/${encodeURIComponent(id)}.json`;
-  try {
-    const res = await fetch(url, { headers: { Accept: "application/json" } });
-    if (!res.ok) {
-      const text = await res.text().catch(() => "");
-      console.error(`[Upstream ${baseUrl}] ${res.status} ${res.statusText} – ${text.slice(0, 200)}`);
-      return [];
-    }
-    const data = await res.json().catch((e) => {
-      console.error(`[Upstream ${baseUrl}] JSON parse error:`, e?.message || e);
-      return {};
-    });
-    const list = Array.isArray(data.streams) ? data.streams : [];
-    if (list.length === 0) {
-      console.warn(`[Upstream ${baseUrl}] No streams returned for ${type}/${id}`);
-    }
-    return list.map(st => ({ ...st, __source: baseUrl }));
-  } catch (e) {
-    console.error(`[Upstream ${baseUrl}] Fetch error:`, e?.message || e);
+  const res = await fetch(url, { headers: { Accept: "application/json" } });
+  if (!res.ok) {
+    console.error("Upstream error:", baseUrl, res.status);
     return [];
   }
+  const data = await res.json();
+  const list = Array.isArray(data.streams) ? data.streams : [];
+  return list.map(st => ({ ...st, __source: baseUrl }));
 }
 async function collectStreams(sources, type, id) {
   const all = [];
-  for (const src of sources) all.push(...await fetchFromSource(src, type, id));
-  // de-duplicate by url/magnet/infoHash
+  for (const src of sources) {
+    try { all.push(...await fetchFromSource(src, type, id)); }
+    catch (e) { console.error("Source failed:", src, e); }
+  }
   const seen = new Set();
   const unique = [];
   for (const st of all) {
@@ -169,9 +153,7 @@ async function collectStreams(sources, type, id) {
   return unique;
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Cinemeta label
-// ──────────────────────────────────────────────────────────────────────────────
+// ── Cinemeta nice names ───────────────────────────────────────────────────────
 async function getDisplayLabel(type, id) {
   try {
     const [imdb, sStr, eStr] = id.split(":");
@@ -201,9 +183,33 @@ async function getDisplayLabel(type, id) {
   }
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Switching rule
-// ──────────────────────────────────────────────────────────────────────────────
+// ── Per-user config via base64url token (stateless) ───────────────────────────
+const b64u = {
+  enc: (obj) => Buffer.from(JSON.stringify(obj)).toString("base64url"),
+  dec: (str) => JSON.parse(Buffer.from(String(str || ""), "base64url").toString("utf8"))
+};
+
+// identify debrid source + whether it has an API key
+function isDebridProviderURL(u) {
+  return /alldebrid|real-?debrid|premiumize/i.test(String(u || ""));
+}
+function hasDebridApiKey(u) {
+  return /(?:^|[|&?])apikey=/i.test(String(u || ""));
+}
+
+function resolveSources(extra) {
+  try {
+    if (extra && extra.cfg) {
+      const cfg = b64u.dec(extra.cfg);
+      if (cfg && typeof cfg.torrentio === "string" && /^https?:\/\//i.test(cfg.torrentio)) {
+        return [cfg.torrentio, ...SOURCES];
+      }
+    }
+  } catch (_) {}
+  return SOURCES;
+}
+
+// ── Prefer lower quality if MUCH faster (configurable) ────────────────────────
 function isMuchFaster(lower, higher, ratioNeed, deltaNeed, rule = PREF.prefer_rule) {
   const sLow  = extractSeeders(lower);
   const sHigh = extractSeeders(higher);
@@ -217,70 +223,68 @@ function bestOfQuality(cands, wantedTag) {
   return filtered.length ? filtered.sort((a, b) => rankStream(b) - rankStream(a))[0] : null;
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Stream handler (pure pass-through of upstream URLs; we only relabel & order)
-// ──────────────────────────────────────────────────────────────────────────────
+// ── Main handler ──────────────────────────────────────────────────────────────
 builder.defineStreamHandler(async ({ type, id, extra }) => {
   try {
     const usedSources = resolveSources(extra);
-    const debridPreferred = usedSources.some(isDebridSource);
+    const debridURL   = usedSources.find(isDebridProviderURL);
+    const debridOK    = debridURL ? hasDebridApiKey(debridURL) : false;
 
-    // Slightly favor 4K/2K when debrid is configured (mirrors Torrentio behavior)
-    const localPref = { ...PREF };
-    if (debridPreferred) {
-      localPref.prefer1080_ratio = Math.max(localPref.prefer1080_ratio, 3.5);
-      localPref.prefer1080_delta = Math.max(localPref.prefer1080_delta, 1000);
-    }
+    console.log("[AutoStream] Using sources:", usedSources);
+    console.log("[AutoStream] Debrid source:", debridURL || "none", "Has API key:", debridOK);
 
     let candidates = await collectStreams(usedSources, type, id);
     if (candidates.length === 0) {
       console.log("No primary results; trying fallback sources …");
       candidates = await collectStreams(FALLBACK_SOURCES, type, id);
     }
-    if (candidates.length === 0) {
-      console.warn("No streams from any source.");
-      return { streams: [] };
+    if (candidates.length === 0) return { streams: [] };
+
+    // If a debrid source with apikey is present, keep 4K/2K more often
+    const localPref = { ...PREF };
+    if (debridOK) {
+      localPref.prefer1080_ratio = Math.max(localPref.prefer1080_ratio, 3.5);
+      localPref.prefer1080_delta = Math.max(localPref.prefer1080_delta, 1000);
     }
 
-    // Debug snapshot
+    let curated = candidates.slice().sort((a, b) => rankStream(b) - rankStream(a))[0];
+
     const best2160 = bestOfQuality(candidates, "2160p");
     const best1440 = bestOfQuality(candidates, "1440p");
     const best1080 = bestOfQuality(candidates, "1080p");
     const best720  = bestOfQuality(candidates, "720p");
+
     console.log(
       "Seeds — 2160:", best2160 && extractSeeders(best2160),
       "1440:", best1440 && extractSeeders(best1440),
       "1080:", best1080 && extractSeeders(best1080),
       "720:",  best720  && extractSeeders(best720),
-      "DebridPreferred:", debridPreferred
+      "DebridPreferred:", debridOK
     );
 
-    // Initial pick by composite rank
-    let curated = candidates.slice().sort((a, b) => rankStream(b) - rankStream(a))[0];
-
-    // Keep 4K/2K unless 1080p is MUCH faster (and 720p can take over 1080p if MUCH faster)
     const curTagA = qualityTag(combinedLabel(curated));
     if ((curTagA === "2160p" || curTagA === "1440p") && best1080 &&
         isMuchFaster(best1080, curated, localPref.prefer1080_ratio, localPref.prefer1080_delta, localPref.prefer_rule)) {
       curated = best1080;
     }
+
     const curTagB = qualityTag(combinedLabel(curated));
     if (curTagB === "1080p" && best720 &&
         isMuchFaster(best720, curated, localPref.prefer720_ratio, localPref.prefer720_delta, localPref.prefer_rule)) {
       curated = best720;
     }
 
-    // Nice labels; DO NOT change url/magnet/etc — just relabel & order
     const niceName = await getDisplayLabel(type, id);
-    const relabel = (st) => {
+    const makeCleanWithQ = (st) => {
       const qTag = qualityTag(combinedLabel(st));
       const clean = `${niceName} — ${displayTag(qTag)}`;
+      const normalized = normalizeForResolver(st);
       return {
         obj: {
-          ...st,
+          ...normalized,
           title: clean,
           name: "AutoStream",
-          behaviorHints: { ...(st.behaviorHints || {}), bingeGroup: id }
+          behaviorHints: { ...(normalized.behaviorHints || {}), bingeGroup: id }
         },
         qScore: qualityScoreFromTag(qTag),
         rank: rankStream(st)
@@ -288,26 +292,29 @@ builder.defineStreamHandler(async ({ type, id, extra }) => {
     };
 
     const out = [];
-    out.push(relabel(curated));
+    const curatedPack = makeCleanWithQ(curated);
+    out.push(curatedPack);
+
     if (!is1080pLabel(combinedLabel(curated)) && best1080) {
       const keyA = curated.url || curated.externalUrl || curated.magnet || curated.infoHash;
       const keyB = best1080.url || best1080.externalUrl || best1080.magnet || best1080.infoHash;
-      if (!keyA || !keyB || keyA !== keyB) out.push(relabel(best1080));
+      if (!keyA || !keyB || keyA !== keyB) out.push(makeCleanWithQ(best1080));
     }
 
     const sorted = out.sort((a, b) => b.qScore - a.qScore || b.rank - a.rank).map(x => x.obj);
     return { streams: sorted };
   } catch (err) {
-    console.error("AutoStream handler error:", err);
+    console.error("AutoStream error:", err);
     return { streams: [] };
   }
 });
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Configure UI  (requires API key when a debrid provider is chosen)
-// ──────────────────────────────────────────────────────────────────────────────
+// ── Configure page & server ───────────────────────────────────────────────────
+const PORT = process.env.PORT || 7000;
 const app = express();
 app.use(express.urlencoded({ extended: true }));
+
+// Simple CORS
 app.use((_, res, next) => { res.setHeader("Access-Control-Allow-Origin", "*"); next(); });
 
 function baseOrigin(req) {
@@ -316,18 +323,23 @@ function baseOrigin(req) {
   return `${proto}://${req.get("host")}`;
 }
 
-function buildTorrentioUrl({ provider = "alldebrid", cached = true, apikey = "" }) {
-  const p = (provider || "alldebrid").toLowerCase();
+// Build a Torrentio URL for a given provider
+// provider: 'none' | 'alldebrid' | 'real-debrid' | 'premiumize'
+function buildTorrentioUrl({ provider = "none", cached = true, apikey = "" }) {
+  const p = (provider || "none").toLowerCase();
+  if (p === "none") return null;
+
+  // API key is required for all debrid providers
+  if (!apikey) throw new Error("API key is required for the selected debrid provider.");
+
   const slug = p.includes("real") ? "real-debrid" : p.includes("prem") ? "premiumize" : "alldebrid";
   const params = [];
   if (cached) params.push("cached=true");
-  params.push("exclude=cam,ts", "audio=english", "sort=seeders");
-  // include both casings; some builds expect one or the other
-  params.push("apikey=" + encodeURIComponent(apikey), "apiKey=" + encodeURIComponent(apikey));
+  params.push("exclude=cam,ts", "audio=english", "sort=seeders", "apikey=" + encodeURIComponent(apikey));
   return `https://torrentio.strem.fun/${slug}|${params.join("&")}`;
 }
 
-const FORM_HTML = `
+const FORM_HTML = (errorMsg = "") => `
 <!doctype html>
 <meta name="viewport" content="width=device-width,initial-scale=1" />
 <title>AutoStream — Configure</title>
@@ -344,18 +356,22 @@ const FORM_HTML = `
   input[type=checkbox]{width:18px;height:18px}
   .btn{display:block;width:100%;margin-top:16px;padding:14px 18px;border-radius:12px;border:1px solid #2b2f55;background:#191c36;color:#fff;text-decoration:none;text-align:center}
   .btn:hover{background:#1f2345}
-  .err{background:#2a1320;border:1px solid #7d2a3c;color:#ffd3da;padding:10px;border-radius:10px;margin-bottom:12px}
+  code{background:#171a31;border:1px solid #2b2f55;border-radius:8px;padding:3px 7px}
+  small{opacity:.7}
+  .err{background:#3b1220;border:1px solid #7a213a;color:#ffd8e1;padding:10px;border-radius:10px;margin-bottom:12px}
 </style>
 <div class="wrap">
   <h1>AutoStream — Configure</h1>
   <div class="card">
+    ${errorMsg ? `<div class="err">${errorMsg}</div>` : ""}
     <form method="POST" action="/configure">
       <div class="row">
         <label>Debrid provider</label>
         <select name="provider">
-          <option>AllDebrid</option>
-          <option>RealDebrid</option>
-          <option>Premiumize</option>
+          <option value="none">No Debrid (use defaults)</option>
+          <option value="alldebrid">AllDebrid</option>
+          <option value="real-debrid">RealDebrid</option>
+          <option value="premiumize">Premiumize</option>
         </select>
       </div>
 
@@ -365,37 +381,41 @@ const FORM_HTML = `
       </div>
 
       <div class="row">
-        <label>Debrid API key <b>(required)</b></label>
-        <input type="text" name="apikey" placeholder="Paste your provider’s API key" required />
+        <label>Debrid API key</label>
+        <input type="text" name="apikey" placeholder="Required for selected debrid provider" />
       </div>
 
       <button class="btn" type="submit">Install in Stremio</button>
     </form>
+    <p><small>
+      Clicking Install tries to open the Stremio app via the <code>stremio://</code> link.
+      If your browser blocks it, copy the manifest URL shown on the next screen and use
+      <b>Add-ons → Install via URL</b>.
+    </small></p>
   </div>
 </div>
 `;
 
-app.get("/", (_, res) => { res.setHeader("Content-Type", "text/html; charset=utf-8"); res.end(FORM_HTML); });
-app.get("/configure", (_, res) => { res.setHeader("Content-Type", "text/html; charset=utf-8"); res.end(FORM_HTML); });
+app.get("/", (_, res) => { res.setHeader("Content-Type", "text/html; charset=utf-8"); res.end(FORM_HTML()); });
+app.get("/configure", (_, res) => { res.setHeader("Content-Type", "text/html; charset=utf-8"); res.end(FORM_HTML()); });
 
 app.post("/configure", (req, res) => {
-  const provider = String(req.body.provider || "AllDebrid");
-  const cached = !!req.body.cached;
-  const apikey = String(req.body.apikey || "").trim();
+  const provider = String(req.body.provider || "none").toLowerCase();
+  const cached   = !!req.body.cached;
+  const apikey   = String(req.body.apikey || "").trim();
 
-  if (!apikey) {
+  let torrentio = null;
+  try {
+    torrentio = buildTorrentioUrl({ provider, cached, apikey }); // returns null if provider === 'none'
+  } catch (e) {
     res.setHeader("Content-Type", "text/html; charset=utf-8");
-    return res.end(FORM_HTML.replace(
-      '<div class="card">',
-      '<div class="card"><div class="err">API key is required for the selected debrid provider.</div>'
-    ));
+    return res.end(FORM_HTML(e.message));
   }
 
-  const torrentio = buildTorrentioUrl({ provider, cached, apikey });
-  const cfg = b64u.enc({ torrentio });
-
+  const cfg = torrentio ? b64u.enc({ torrentio }) : b64u.enc({});
   const origin = baseOrigin(req);
-  // Keep cfg in the PATH so Stremio uses it for all addon routes
+
+  // Put cfg into the PATH so Stremio carries it across routes
   const manifestUrl = `${origin}/u/${cfg}/manifest.json`;
   const deep = `stremio://addon-install?url=${encodeURIComponent(manifestUrl)}`;
 
@@ -425,31 +445,20 @@ app.post("/configure", (req, res) => {
   </div>`);
 });
 
-// Mount addon interface (base + cfg-aware)
+// ---- Mount addon interface
 const iface = builder.getInterface();
 const router = getRouter(iface);
 
 // Base (no cfg)
 app.use("/", router);
 
-// Config-aware: /u/:cfg/*  → inject cfg back into req.query so SDK passes it as `extra`
+// Config-aware base: /u/:cfg/...
+// We inject ?cfg=... back into req.query so the SDK passes it to the handler as "extra".
 app.use("/u/:cfg", (req, _res, next) => {
   req.query = Object.assign({}, req.query, { cfg: req.params.cfg });
   next();
 }, router);
 
-// Convenience health/debug endpoints
-app.get("/healthz", (_req, res) => res.status(200).send("ok"));
-app.get("/debug/whoami", (req, res) => {
-  res.json({
-    origin: (req.headers["x-forwarded-proto"] || req.protocol) + "://" + req.get("host"),
-    url: req.originalUrl,
-    ip: req.ip,
-  });
-});
-
-// Single PORT declaration
-const PORT = process.env.PORT || 7000;
 app.listen(PORT, () => {
   console.log(`AutoStream add-on running on port ${PORT}`);
   console.log("Primary sources:", SOURCES);
