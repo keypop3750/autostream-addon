@@ -118,15 +118,22 @@ function buildMagnet(st) {
   const tr = COMMON_TRACKERS.map(t => "&tr=" + encodeURIComponent(t)).join("");
   return `magnet:?xt=urn:btih:${infoHash}&dn=${dn}${tr}`;
 }
+
+// Normalize for resolvers: keep existing URL; only synthesize when necessary
 function normalizeForResolver(st) {
-  const magnet = buildMagnet(st);
-  const url = magnet || st.url || st.externalUrl || null;
-  return {
-    ...st,
-    url,
-    magnet: magnet || st.magnet,
-    behaviorHints: { ...(st.behaviorHints || {}), notWebReady: false }
-  };
+  const out = { ...st };
+  // If upstream already gave a URL, keep it (often a magnet/redirect).
+  if (!out.url && out.externalUrl) out.url = out.externalUrl;
+  if (!out.url && (out.magnet || out.infoHash || out.infohash || out.hash)) {
+    const m = buildMagnet(out);
+    if (m) {
+      out.magnet = m;
+      out.url = m;
+      // magnets are not web-ready; let resolvers handle them
+      out.behaviorHints = { ...(out.behaviorHints || {}), notWebReady: true };
+    }
+  }
+  return out;
 }
 
 // ── Fetch from upstreams ──────────────────────────────────────────────────────
@@ -267,7 +274,10 @@ builder.defineStreamHandler(async ({ type, id, extra }) => {
     const makeCleanWithQ = (st) => {
       const qTag = qualityTag(combinedLabel(st));
       const clean = `${niceName} — ${displayTag(qTag)}`;
+
       const normalized = normalizeForResolver(st);
+      if (!normalized.url) return null; // drop unplayable
+
       return {
         obj: {
           ...normalized,
@@ -281,13 +291,16 @@ builder.defineStreamHandler(async ({ type, id, extra }) => {
     };
 
     const out = [];
-    const curatedPack = makeCleanWithQ(curated);
-    out.push(curatedPack);
+    const curatedPacked = makeCleanWithQ(curated);
+    if (curatedPacked) out.push(curatedPacked);
 
     if (!is1080pLabel(combinedLabel(curated)) && best1080) {
       const keyA = curated.url || curated.externalUrl || curated.magnet || curated.infoHash;
       const keyB = best1080.url || best1080.externalUrl || best1080.magnet || best1080.infoHash;
-      if (!keyA || !keyB || keyA !== keyB) out.push(makeCleanWithQ(best1080));
+      if (!keyA || !keyB || keyA !== keyB) {
+        const b1080 = makeCleanWithQ(best1080);
+        if (b1080) out.push(b1080);
+      }
     }
 
     const sorted = out.sort((a, b) => b.qScore - a.qScore || b.rank - a.rank).map(x => x.obj);
@@ -301,8 +314,6 @@ builder.defineStreamHandler(async ({ type, id, extra }) => {
 // ── Configure page & server ───────────────────────────────────────────────────
 const app = express();
 app.use(express.urlencoded({ extended: true }));
-
-// Simple CORS
 app.use((_, res, next) => { res.setHeader("Access-Control-Allow-Origin", "*"); next(); });
 
 function baseOrigin(req) {
@@ -387,8 +398,7 @@ app.post("/configure", (req, res) => {
   const cfg = b64u.enc({ torrentio });
 
   const origin = baseOrigin(req);
-  // IMPORTANT: embed cfg in the PATH so Stremio keeps it for all requests
-  const manifestUrl = `${origin}/u/${cfg}/manifest.json`;
+  const manifestUrl = `${origin}/u/${cfg}/manifest.json`; // cfg in PATH
   const deep = `stremio://addon-install?url=${encodeURIComponent(manifestUrl)}`;
 
   res.setHeader("Content-Type", "text/html; charset=utf-8");
@@ -417,21 +427,20 @@ app.post("/configure", (req, res) => {
   </div>`);
 });
 
-// ---- Mount addon interface
-const iface  = builder.getInterface();
+// ---- Mount addon interface (base and cfg-aware)
+const iface = builder.getInterface();
 const router = getRouter(iface);
 
-// Config-aware base: /u/:cfg/...
-// Inject ?cfg=... so the SDK passes it as "extra" to our stream handler.
+// base (no cfg)
+app.use("/", router);
+
+// cfg-aware base (/u/:cfg/*) → inject cfg back to query so SDK passes it in `extra`
 app.use("/u/:cfg", (req, _res, next) => {
   req.query = Object.assign({}, req.query, { cfg: req.params.cfg });
   next();
 }, router);
 
-// Plain base (no cfg) — mount AFTER the /u/:cfg route
-app.use("/", router);
-
-// Start server
+// single PORT declaration
 const PORT = process.env.PORT || 7000;
 app.listen(PORT, () => {
   console.log(`AutoStream add-on running on port ${PORT}`);
