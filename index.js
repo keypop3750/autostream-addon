@@ -441,16 +441,24 @@ app.post("/configure", (req, res) => {
 const iface = builder.getInterface();
 const router = getRouter(iface);
 
-// Inject cfg from path into query BEFORE hitting the router
-app.use("/u/:cfg", (req, _res, next) => {
-  req.query = Object.assign({}, req.query, { cfg: req.params.cfg });
-  next();
-}, router);
-
 // Plain base (no cfg)
 app.use("/", router);
 
-// Generic error handler so the router never crashes the process
+// Inject ?cfg=... only for the manifest/stream endpoints under /u/:cfg
+function injectCfg(req, _res, next) {
+  req.query = Object.assign({}, req.query, { cfg: req.params.cfg });
+  next();
+}
+
+// Config-aware endpoints (explicit, so we don't swallow /u/:cfg/anything-else)
+app.get("/u/:cfg/manifest.json", injectCfg, (req, res) => iface.manifest(req, res));
+app.get("/u/:cfg/stream/:type/:id.json", injectCfg, (req, res) => iface.get(req, res));
+app.post("/u/:cfg/stream/:type/:id.json", injectCfg, (req, res) => iface.post(req, res));
+
+// Nice-to-have: if someone lands on /u/:cfg/configure, send them to the real page
+app.get("/u/:cfg/configure", (_req, res) => res.redirect("/configure"));
+
+// Generic error handler so nothing crashes
 app.use((err, req, res, _next) => {
   console.error("[Route error]", err);
   if (!res.headersSent) {
@@ -459,10 +467,3 @@ app.use((err, req, res, _next) => {
   }
 });
 
-const PORT = process.env.PORT || 7000;
-app.listen(PORT, () => {
-  console.log(`AutoStream add-on running on port ${PORT}`);
-  console.log("Primary sources:", SOURCES);
-  console.log("Fallback sources:", FALLBACK_SOURCES);
-  console.log("Lower-quality prefs:", PREF);
-});
