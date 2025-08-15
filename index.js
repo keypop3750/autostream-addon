@@ -37,7 +37,7 @@ const PREF = Object.assign(
 // ── Manifest ──────────────────────────────────────────────────────────────────
 const manifest = {
   id: "org.autostream.best",
-  version: "1.9.3",
+  version: "1.9.4",
   name: "AutoStream",
   description:
     "AutoStream picks the best stream for each title, balancing quality with speed (seeders). If a lower resolution like 1080p or 720p is much faster than 4K/2K, it’s preferred for smoother playback. You’ll usually see one link; when helpful, a second 1080p option appears. Titles are neat (e.g., “Movie Name — 1080p”).",
@@ -236,6 +236,7 @@ builder.defineStreamHandler(async ({ type, id, extra }) => {
 
     const localPref = { ...PREF };
     if (debridOK) {
+      // keep 4K/2K more often when debrid is present
       localPref.prefer1080_ratio = Math.max(localPref.prefer1080_ratio, 3.5);
       localPref.prefer1080_delta = Math.max(localPref.prefer1080_delta, 1000);
     }
@@ -307,17 +308,6 @@ builder.defineStreamHandler(async ({ type, id, extra }) => {
 const app = express();
 app.set("trust proxy", true);
 app.use(express.urlencoded({ extended: true }));
-
-// Small helper: safely wrap any handler to avoid unhandled rejections
-const safe = (handler) => (req, res, next) =>
-  Promise.resolve(handler(req, res, next)).catch((err) => {
-    console.error("[Route error]", err);
-    if (!res.headersSent) {
-      // Return an empty object (manifest) or empty streams so Stremio doesn't explode
-      if (req.path.endsWith("manifest.json")) return res.status(500).json({});
-      return res.status(500).json({ streams: [] });
-    }
-  });
 
 function baseOrigin(req) {
   const xf = (req.headers["x-forwarded-proto"] || "").toString().split(",")[0].trim();
@@ -396,10 +386,13 @@ const FORM_HTML = (errorMsg = "") => `
 </div>
 `;
 
-app.get("/configure", (_req, res) => { res.setHeader("Content-Type", "text/html; charset=utf-8"); res.end(FORM_HTML()); });
+app.get("/configure", (_req, res) => {
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.end(FORM_HTML());
+});
 app.get("/", (_req, res) => res.redirect("/configure"));
 
-app.post("/configure", safe((req, res) => {
+app.post("/configure", (req, res) => {
   const provider = String(req.body.provider || "none").toLowerCase();
   const cached   = !!req.body.cached;
   const apikey   = String(req.body.apikey || "").trim();
@@ -442,29 +435,29 @@ app.post("/configure", safe((req, res) => {
       <p><a class="btn" href="/configure">Back</a></p>
     </div>
   </div>`);
-}));
+});
 
-// ---- Mount addon interface (explicit + safe) --------------------------------
+// ---- Mount addon interface (router form) ------------------------------------
 const iface = builder.getInterface();
+const router = getRouter(iface);
 
-// Base (no cfg)
-app.get("/manifest.json", safe((req, res) => iface.manifest(req, res)));
-app.get("/stream/:type/:id.json", safe((req, res) => iface.get(req, res)));
-app.post("/stream/:type/:id.json", safe((req, res) => iface.post(req, res)));
+// Inject cfg from path into query BEFORE hitting the router
+app.use("/u/:cfg", (req, _res, next) => {
+  req.query = Object.assign({}, req.query, { cfg: req.params.cfg });
+  next();
+}, router);
 
-// Config-aware base: /u/:cfg/...
-app.get("/u/:cfg/manifest.json", safe((req, res) => {
-  req.query = Object.assign({}, req.query, { cfg: req.params.cfg });
-  iface.manifest(req, res);
-}));
-app.get("/u/:cfg/stream/:type/:id.json", safe((req, res) => {
-  req.query = Object.assign({}, req.query, { cfg: req.params.cfg });
-  iface.get(req, res);
-}));
-app.post("/u/:cfg/stream/:type/:id.json", safe((req, res) => {
-  req.query = Object.assign({}, req.query, { cfg: req.params.cfg });
-  iface.post(req, res);
-}));
+// Plain base (no cfg)
+app.use("/", router);
+
+// Generic error handler so the router never crashes the process
+app.use((err, req, res, _next) => {
+  console.error("[Route error]", err);
+  if (!res.headersSent) {
+    if (req.path.endsWith("/manifest.json")) return res.status(500).json({});
+    return res.status(500).json({ streams: [] });
+  }
+});
 
 const PORT = process.env.PORT || 7000;
 app.listen(PORT, () => {
