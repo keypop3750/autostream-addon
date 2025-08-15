@@ -4,6 +4,14 @@ const express = require("express");
 const fs = require("fs");
 const path = require("path");
 
+// ── Harden process: never crash on async errors ───────────────────────────────
+process.on("unhandledRejection", (reason) => {
+  console.error("[FATAL] Unhandled promise rejection:", reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error("[FATAL] Uncaught exception:", err);
+});
+
 // ── Load config ───────────────────────────────────────────────────────────────
 let config;
 try {
@@ -29,7 +37,7 @@ const PREF = Object.assign(
 // ── Manifest ──────────────────────────────────────────────────────────────────
 const manifest = {
   id: "org.autostream.best",
-  version: "1.9.2",
+  version: "1.9.3",
   name: "AutoStream",
   description:
     "AutoStream picks the best stream for each title, balancing quality with speed (seeders). If a lower resolution like 1080p or 720p is much faster than 4K/2K, it’s preferred for smoother playback. You’ll usually see one link; when helpful, a second 1080p option appears. Titles are neat (e.g., “Movie Name — 1080p”).",
@@ -103,15 +111,23 @@ function rankStream(st) {
 
 // ── Fetch from upstreams ──────────────────────────────────────────────────────
 async function fetchFromSource(baseUrl, type, id) {
-  const url = `${baseUrl}/stream/${encodeURIComponent(type)}/${encodeURIComponent(id)}.json`;
-  const res = await fetch(url, { headers: { Accept: "application/json" } });
-  if (!res.ok) {
-    console.error("Upstream error:", baseUrl, res.status);
+  try {
+    const url = `${baseUrl}/stream/${encodeURIComponent(type)}/${encodeURIComponent(id)}.json`;
+    const res = await fetch(url, { headers: { Accept: "application/json" } });
+    if (!res.ok) {
+      console.error("[Upstream]", baseUrl, "HTTP", res.status);
+      return [];
+    }
+    const data = await res.json().catch((e) => {
+      console.error("[Upstream]", baseUrl, "bad JSON:", e?.message || e);
+      return {};
+    });
+    const list = Array.isArray(data.streams) ? data.streams : [];
+    return list.map(st => ({ ...st, __source: baseUrl }));
+  } catch (e) {
+    console.error("[Upstream]", baseUrl, "threw:", e?.message || e);
     return [];
   }
-  const data = await res.json();
-  const list = Array.isArray(data.streams) ? data.streams : [];
-  return list.map(st => ({ ...st, __source: baseUrl }));
 }
 async function collectStreams(sources, type, id) {
   const all = [];
@@ -218,7 +234,6 @@ builder.defineStreamHandler(async ({ type, id, extra }) => {
       return { streams: [] };
     }
 
-    // keep 4K/2K more often when debrid present with key
     const localPref = { ...PREF };
     if (debridOK) {
       localPref.prefer1080_ratio = Math.max(localPref.prefer1080_ratio, 3.5);
@@ -254,7 +269,7 @@ builder.defineStreamHandler(async ({ type, id, extra }) => {
 
     const niceName = await getDisplayLabel(type, id);
 
-    // IMPORTANT: do NOT rewrite url/magnet; keep upstream fields so Torrentio can handle debrid
+    // pass-through streams; only tidy the title
     const makeCleanWithQ = (st) => {
       const qTag = qualityTag(combinedLabel(st));
       const clean = `${niceName} — ${displayTag(qTag)}`;
@@ -290,10 +305,19 @@ builder.defineStreamHandler(async ({ type, id, extra }) => {
 
 // ── Configure page & server ───────────────────────────────────────────────────
 const app = express();
+app.set("trust proxy", true);
 app.use(express.urlencoded({ extended: true }));
 
-// Simple CORS
-app.use((_, res, next) => { res.setHeader("Access-Control-Allow-Origin", "*"); next(); });
+// Small helper: safely wrap any handler to avoid unhandled rejections
+const safe = (handler) => (req, res, next) =>
+  Promise.resolve(handler(req, res, next)).catch((err) => {
+    console.error("[Route error]", err);
+    if (!res.headersSent) {
+      // Return an empty object (manifest) or empty streams so Stremio doesn't explode
+      if (req.path.endsWith("manifest.json")) return res.status(500).json({});
+      return res.status(500).json({ streams: [] });
+    }
+  });
 
 function baseOrigin(req) {
   const xf = (req.headers["x-forwarded-proto"] || "").toString().split(",")[0].trim();
@@ -306,7 +330,6 @@ function buildTorrentioUrl({ provider = "none", cached = true, apikey = "" }) {
   const p = (provider || "none").toLowerCase();
   if (p === "none") return null;
 
-  // API key is required for all debrid providers
   if (!apikey) throw new Error("API key is required for the selected debrid provider.");
 
   const slug = p.includes("real") ? "real-debrid" : p.includes("prem") ? "premiumize" : "alldebrid";
@@ -373,10 +396,10 @@ const FORM_HTML = (errorMsg = "") => `
 </div>
 `;
 
-app.get("/", (_, res) => { res.setHeader("Content-Type", "text/html; charset=utf-8"); res.end(FORM_HTML()); });
-app.get("/configure", (_, res) => { res.setHeader("Content-Type", "text/html; charset=utf-8"); res.end(FORM_HTML()); });
+app.get("/configure", (_req, res) => { res.setHeader("Content-Type", "text/html; charset=utf-8"); res.end(FORM_HTML()); });
+app.get("/", (_req, res) => res.redirect("/configure"));
 
-app.post("/configure", (req, res) => {
+app.post("/configure", safe((req, res) => {
   const provider = String(req.body.provider || "none").toLowerCase();
   const cached   = !!req.body.cached;
   const apikey   = String(req.body.apikey || "").trim();
@@ -392,7 +415,6 @@ app.post("/configure", (req, res) => {
   const cfg = torrentio ? b64u.enc({ torrentio }) : b64u.enc({});
   const origin = baseOrigin(req);
 
-  // IMPORTANT: keep cfg in the PATH so Desktop carries it across routes
   const manifestUrl = `${origin}/u/${cfg}/manifest.json`;
   const deep = `stremio://addon-install?url=${encodeURIComponent(manifestUrl)}`;
 
@@ -420,35 +442,29 @@ app.post("/configure", (req, res) => {
       <p><a class="btn" href="/configure">Back</a></p>
     </div>
   </div>`);
-});
+}));
 
-// ---- Mount addon interface
+// ---- Mount addon interface (explicit + safe) --------------------------------
 const iface = builder.getInterface();
-const router = getRouter(iface);
 
 // Base (no cfg)
-app.get("/manifest.json", (req, res) => iface.manifest(req, res));
-app.get("/stream/:type/:id.json", (req, res) => iface.get(req, res));
-app.post("/stream/:type/:id.json", (req, res) => iface.post(req, res));
+app.get("/manifest.json", safe((req, res) => iface.manifest(req, res)));
+app.get("/stream/:type/:id.json", safe((req, res) => iface.get(req, res)));
+app.post("/stream/:type/:id.json", safe((req, res) => iface.post(req, res)));
 
 // Config-aware base: /u/:cfg/...
-// Inject ?cfg=... before delegating to the SDK handlers.
-// Explicit routes are REQUIRED for Stremio Desktop to keep cfg across requests.
-app.get("/u/:cfg/manifest.json", (req, res) => {
+app.get("/u/:cfg/manifest.json", safe((req, res) => {
   req.query = Object.assign({}, req.query, { cfg: req.params.cfg });
   iface.manifest(req, res);
-});
-app.get("/u/:cfg/stream/:type/:id.json", (req, res) => {
+}));
+app.get("/u/:cfg/stream/:type/:id.json", safe((req, res) => {
   req.query = Object.assign({}, req.query, { cfg: req.params.cfg });
   iface.get(req, res);
-});
-app.post("/u/:cfg/stream/:type/:id.json", (req, res) => {
+}));
+app.post("/u/:cfg/stream/:type/:id.json", safe((req, res) => {
   req.query = Object.assign({}, req.query, { cfg: req.params.cfg });
   iface.post(req, res);
-});
-
-// Root landing -> configurator
-app.get("/", (_, res) => res.redirect("/configure"));
+}));
 
 const PORT = process.env.PORT || 7000;
 app.listen(PORT, () => {
