@@ -29,7 +29,7 @@ const PREF = Object.assign(
 // ── Manifest ──────────────────────────────────────────────────────────────────
 const manifest = {
   id: "org.autostream.best",
-  version: "1.8.1",
+  version: "1.8.2",
   name: "AutoStream",
   description:
     "AutoStream picks the best stream for each title, balancing quality with speed (seeders). If a lower resolution like 1080p or 720p is much faster than 4K/2K, it’s preferred for smoother playback. You’ll usually see one link; when helpful, a second 1080p option appears. Titles are neat (e.g., “Movie Name — 1080p”).",
@@ -104,7 +104,7 @@ function rankStream(st) {
   return q + speed + preferenceBonus(label);
 }
 
-// Prefer magnets so resolvers (e.g., Debrid) can catch them
+// ── Magnet handling ───────────────────────────────────────────────────────────
 const COMMON_TRACKERS = [
   "udp://tracker.opentrackr.org:1337/announce",
   "udp://open.stealth.si:80/announce",
@@ -119,21 +119,28 @@ function buildMagnet(st) {
   return `magnet:?xt=urn:btih:${infoHash}&dn=${dn}${tr}`;
 }
 
-// Normalize for resolvers: keep existing URL; only synthesize when necessary
+// Normalize: prefer HTTP links; otherwise give resolvers a magnet
 function normalizeForResolver(st) {
   const out = { ...st };
-  // If upstream already gave a URL, keep it (often a magnet/redirect).
   if (!out.url && out.externalUrl) out.url = out.externalUrl;
-  if (!out.url && (out.magnet || out.infoHash || out.infohash || out.hash)) {
-    const m = buildMagnet(out);
-    if (m) {
-      out.magnet = m;
-      out.url = m;
-      // magnets are not web-ready; let resolvers handle them
-      out.behaviorHints = { ...(out.behaviorHints || {}), notWebReady: true };
-    }
+
+  // If we already have an http(s) URL, keep it and make sure it's web-ready
+  if (typeof out.url === "string" && /^https?:\/\//i.test(out.url)) {
+    out.behaviorHints = { ...(out.behaviorHints || {}), notWebReady: false };
+    return out;
   }
-  return out;
+
+  // Otherwise try to synthesize a magnet (resolver / torrent engine will take it)
+  const m = out.url && String(out.url).startsWith("magnet:") ? out.url : buildMagnet(out);
+  if (m) {
+    out.magnet = m;
+    out.url = m;
+    out.behaviorHints = { ...(out.behaviorHints || {}), notWebReady: true };
+    return out;
+  }
+
+  // No playable URL
+  return null;
 }
 
 // ── Fetch from upstreams ──────────────────────────────────────────────────────
@@ -196,7 +203,8 @@ const b64u = {
   dec: (str) => JSON.parse(Buffer.from(String(str || ""), "base64url").toString("utf8"))
 };
 function isDebridEndpoint(u) {
-  return /alldebrid|real-?debrid|premiumize/i.test(String(u || ""));
+  const s = String(u || "");
+  return /(alldebrid|real-?debrid|premiumize)/i.test(s) && /(apikey=|apiKey=)/i.test(s);
 }
 function resolveSources(extra) {
   try {
@@ -243,6 +251,14 @@ builder.defineStreamHandler(async ({ type, id, extra }) => {
       localPref.prefer1080_delta = Math.max(localPref.prefer1080_delta, 1000);
     }
 
+    // Prefer HTTP candidates first when we came from a debrid source
+    if (debridPreferred) {
+      candidates = [
+        ...candidates.filter(s => /^https?:\/\//i.test(s.url || s.externalUrl || "")),
+        ...candidates.filter(s => !/^https?:\/\//i.test(s.url || s.externalUrl || ""))
+      ];
+    }
+
     let curated = candidates.slice().sort((a, b) => rankStream(b) - rankStream(a))[0];
 
     const best2160 = bestOfQuality(candidates, "2160p");
@@ -276,7 +292,7 @@ builder.defineStreamHandler(async ({ type, id, extra }) => {
       const clean = `${niceName} — ${displayTag(qTag)}`;
 
       const normalized = normalizeForResolver(st);
-      if (!normalized.url) return null; // drop unplayable
+      if (!normalized) return null;
 
       return {
         obj: {
@@ -322,13 +338,15 @@ function baseOrigin(req) {
   return `${proto}://${req.get("host")}`;
 }
 
+// Build Torrentio URL for a debrid provider (API key required)
 function buildTorrentioUrl({ provider = "alldebrid", cached = true, apikey = "" }) {
   const p = (provider || "alldebrid").toLowerCase();
   const slug = p.includes("real") ? "real-debrid" : p.includes("prem") ? "premiumize" : "alldebrid";
   const params = [];
   if (cached) params.push("cached=true");
   params.push("exclude=cam,ts", "audio=english", "sort=seeders");
-  if (apikey) params.push("apikey=" + encodeURIComponent(apikey));
+  // include both casings, some builds look for one or the other
+  params.push("apikey=" + encodeURIComponent(apikey), "apiKey=" + encodeURIComponent(apikey));
   return `https://torrentio.strem.fun/${slug}|${params.join("&")}`;
 }
 
@@ -349,8 +367,7 @@ const FORM_HTML = `
   input[type=checkbox]{width:18px;height:18px}
   .btn{display:block;width:100%;margin-top:16px;padding:14px 18px;border-radius:12px;border:1px solid #2b2f55;background:#191c36;color:#fff;text-decoration:none;text-align:center}
   .btn:hover{background:#1f2345}
-  code{background:#171a31;border:1px solid #2b2f55;border-radius:8px;padding:3px 7px}
-  small{opacity:.7}
+  .err{background:#2a1320;border:1px solid #7d2a3c;color:#ffd3da;padding:10px;border-radius:10px;margin-bottom:12px}
 </style>
 <div class="wrap">
   <h1>AutoStream — Configure</h1>
@@ -371,17 +388,12 @@ const FORM_HTML = `
       </div>
 
       <div class="row">
-        <label>Debrid API key (optional)</label>
-        <input type="text" name="apikey" placeholder="Paste your provider’s API key (if required)" />
+        <label>Debrid API key <b>(required)</b></label>
+        <input type="text" name="apikey" placeholder="Paste your provider’s API key" required />
       </div>
 
       <button class="btn" type="submit">Install in Stremio</button>
     </form>
-    <p><small>
-      Clicking Install tries to open the Stremio app via the <code>stremio://</code> link.
-      If your browser blocks it, copy the manifest URL shown on the next screen and use
-      <b>Add-ons → Install via URL</b>.
-    </small></p>
   </div>
 </div>
 `;
@@ -393,6 +405,14 @@ app.post("/configure", (req, res) => {
   const provider = String(req.body.provider || "AllDebrid");
   const cached = !!req.body.cached;
   const apikey = String(req.body.apikey || "").trim();
+
+  if (!apikey) {
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    return res.end(FORM_HTML.replace(
+      '<div class="card">',
+      '<div class="card"><div class="err">API key is required for the selected debrid provider.</div>'
+    ));
+  }
 
   const torrentio = buildTorrentioUrl({ provider, cached, apikey });
   const cfg = b64u.enc({ torrentio });
