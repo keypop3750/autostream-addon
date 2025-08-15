@@ -1,10 +1,8 @@
 {
   "name": "autostream-addon",
-  "version": "1.6.1",
+  "version": "1.9.2",
   "main": "index.js",
-  "scripts": {
-    "start": "node index.js"
-  },
+  "scripts": { "start": "node index.js" },
   "engines": { "node": ">=18" },
   "dependencies": {
     "express": "^4.19.2",
