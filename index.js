@@ -158,28 +158,29 @@ async function getDisplayLabel(type, id) {
   }
 }
 
-// ── Per-user config via base64url token (stateless) ───────────────────────────
+// ── Per-user cfg (base64url) ─────────────────────────────────────────────────
 const b64u = {
   enc: (obj) => Buffer.from(JSON.stringify(obj)).toString("base64url"),
   dec: (str) => JSON.parse(Buffer.from(String(str || ""), "base64url").toString("utf8"))
 };
-
 function isDebridProviderURL(u) {
   return /alldebrid|real-?debrid|premiumize/i.test(String(u || ""));
 }
 function hasDebridApiKey(u) {
   return /(?:^|[|&?])apikey=/i.test(String(u || ""));
 }
-
 function resolveSources(extra) {
   try {
     if (extra && extra.cfg) {
       const cfg = b64u.dec(extra.cfg);
       if (cfg && typeof cfg.torrentio === "string" && /^https?:\/\//i.test(cfg.torrentio)) {
+        console.log("[AutoStream] cfg decoded:", cfg);
         return [cfg.torrentio, ...SOURCES];
       }
     }
-  } catch (_) {}
+  } catch (e) {
+    console.warn("[AutoStream] cfg decode failed:", e?.message || e);
+  }
   return SOURCES;
 }
 
@@ -217,7 +218,7 @@ builder.defineStreamHandler(async ({ type, id, extra }) => {
       return { streams: [] };
     }
 
-    // If a debrid source with apikey is present, keep 4K/2K more often
+    // keep 4K/2K more often when debrid present with key
     const localPref = { ...PREF };
     if (debridOK) {
       localPref.prefer1080_ratio = Math.max(localPref.prefer1080_ratio, 3.5);
@@ -252,20 +253,17 @@ builder.defineStreamHandler(async ({ type, id, extra }) => {
     }
 
     const niceName = await getDisplayLabel(type, id);
+
+    // IMPORTANT: do NOT rewrite url/magnet; keep upstream fields so Torrentio can handle debrid
     const makeCleanWithQ = (st) => {
       const qTag = qualityTag(combinedLabel(st));
       const clean = `${niceName} — ${displayTag(qTag)}`;
-      // No resolver flow: don’t fabricate magnets; just pass through url if present
-      const normalized = {
-        ...st,
-        url: st.url || st.externalUrl || st.magnet || undefined,
-        behaviorHints: { ...(st.behaviorHints || {}), notWebReady: false, bingeGroup: id }
-      };
       return {
         obj: {
-          ...normalized,
+          ...st,
           title: clean,
-          name: "AutoStream"
+          name: "AutoStream",
+          behaviorHints: { ...(st.behaviorHints || {}), bingeGroup: id }
         },
         qScore: qualityScoreFromTag(qTag),
         rank: rankStream(st)
@@ -291,7 +289,6 @@ builder.defineStreamHandler(async ({ type, id, extra }) => {
 });
 
 // ── Configure page & server ───────────────────────────────────────────────────
-const PORT = process.env.PORT || 7000;
 const app = express();
 app.use(express.urlencoded({ extended: true }));
 
@@ -304,7 +301,6 @@ function baseOrigin(req) {
   return `${proto}://${req.get("host")}`;
 }
 
-// Build a Torrentio URL for a given provider
 // provider: 'none' | 'alldebrid' | 'real-debrid' | 'premiumize'
 function buildTorrentioUrl({ provider = "none", cached = true, apikey = "" }) {
   const p = (provider || "none").toLowerCase();
@@ -387,7 +383,7 @@ app.post("/configure", (req, res) => {
 
   let torrentio = null;
   try {
-    torrentio = buildTorrentioUrl({ provider, cached, apikey }); // returns null if provider === 'none'
+    torrentio = buildTorrentioUrl({ provider, cached, apikey }); // null if provider === 'none'
   } catch (e) {
     res.setHeader("Content-Type", "text/html; charset=utf-8");
     return res.end(FORM_HTML(e.message));
@@ -396,7 +392,7 @@ app.post("/configure", (req, res) => {
   const cfg = torrentio ? b64u.enc({ torrentio }) : b64u.enc({});
   const origin = baseOrigin(req);
 
-  // Put cfg into the PATH so Stremio carries it across routes
+  // IMPORTANT: keep cfg in the PATH so Desktop carries it across routes
   const manifestUrl = `${origin}/u/${cfg}/manifest.json`;
   const deep = `stremio://addon-install?url=${encodeURIComponent(manifestUrl)}`;
 
@@ -426,21 +422,35 @@ app.post("/configure", (req, res) => {
   </div>`);
 });
 
-// ---- Mount addon interface (⚠️ ORDER MATTERS)
+// ---- Mount addon interface
 const iface = builder.getInterface();
 const router = getRouter(iface);
 
-// Config-aware base FIRST: /u/:cfg/...
-// Inject ?cfg=... back into req.query so the SDK passes it to the handler as "extra".
-app.use("/u/:cfg", (req, _res, next) => {
+// Base (no cfg)
+app.get("/manifest.json", (req, res) => iface.manifest(req, res));
+app.get("/stream/:type/:id.json", (req, res) => iface.get(req, res));
+app.post("/stream/:type/:id.json", (req, res) => iface.post(req, res));
+
+// Config-aware base: /u/:cfg/...
+// Inject ?cfg=... before delegating to the SDK handlers.
+// Explicit routes are REQUIRED for Stremio Desktop to keep cfg across requests.
+app.get("/u/:cfg/manifest.json", (req, res) => {
   req.query = Object.assign({}, req.query, { cfg: req.params.cfg });
-  next();
-}, router);
+  iface.manifest(req, res);
+});
+app.get("/u/:cfg/stream/:type/:id.json", (req, res) => {
+  req.query = Object.assign({}, req.query, { cfg: req.params.cfg });
+  iface.get(req, res);
+});
+app.post("/u/:cfg/stream/:type/:id.json", (req, res) => {
+  req.query = Object.assign({}, req.query, { cfg: req.params.cfg });
+  iface.post(req, res);
+});
 
-// Plain base (no cfg) AFTER
-app.use("/", router);
+// Root landing -> configurator
+app.get("/", (_, res) => res.redirect("/configure"));
 
-// Start server
+const PORT = process.env.PORT || 7000;
 app.listen(PORT, () => {
   console.log(`AutoStream add-on running on port ${PORT}`);
   console.log("Primary sources:", SOURCES);
