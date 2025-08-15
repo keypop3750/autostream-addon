@@ -4,14 +4,6 @@ const express = require("express");
 const fs = require("fs");
 const path = require("path");
 
-// ── Harden process: never crash on async errors ───────────────────────────────
-process.on("unhandledRejection", (reason) => {
-  console.error("[FATAL] Unhandled promise rejection:", reason);
-});
-process.on("uncaughtException", (err) => {
-  console.error("[FATAL] Uncaught exception:", err);
-});
-
 // ── Load config ───────────────────────────────────────────────────────────────
 let config;
 try {
@@ -37,7 +29,7 @@ const PREF = Object.assign(
 // ── Manifest ──────────────────────────────────────────────────────────────────
 const manifest = {
   id: "org.autostream.best",
-  version: "1.9.4",
+  version: "1.9.2",
   name: "AutoStream",
   description:
     "AutoStream picks the best stream for each title, balancing quality with speed (seeders). If a lower resolution like 1080p or 720p is much faster than 4K/2K, it’s preferred for smoother playback. You’ll usually see one link; when helpful, a second 1080p option appears. Titles are neat (e.g., “Movie Name — 1080p”).",
@@ -111,23 +103,15 @@ function rankStream(st) {
 
 // ── Fetch from upstreams ──────────────────────────────────────────────────────
 async function fetchFromSource(baseUrl, type, id) {
-  try {
-    const url = `${baseUrl}/stream/${encodeURIComponent(type)}/${encodeURIComponent(id)}.json`;
-    const res = await fetch(url, { headers: { Accept: "application/json" } });
-    if (!res.ok) {
-      console.error("[Upstream]", baseUrl, "HTTP", res.status);
-      return [];
-    }
-    const data = await res.json().catch((e) => {
-      console.error("[Upstream]", baseUrl, "bad JSON:", e?.message || e);
-      return {};
-    });
-    const list = Array.isArray(data.streams) ? data.streams : [];
-    return list.map(st => ({ ...st, __source: baseUrl }));
-  } catch (e) {
-    console.error("[Upstream]", baseUrl, "threw:", e?.message || e);
+  const url = `${baseUrl}/stream/${encodeURIComponent(type)}/${encodeURIComponent(id)}.json`;
+  const res = await fetch(url, { headers: { Accept: "application/json" } });
+  if (!res.ok) {
+    console.error("Upstream error:", baseUrl, res.status);
     return [];
   }
+  const data = await res.json();
+  const list = Array.isArray(data.streams) ? data.streams : [];
+  return list.map(st => ({ ...st, __source: baseUrl }));
 }
 async function collectStreams(sources, type, id) {
   const all = [];
@@ -174,29 +158,28 @@ async function getDisplayLabel(type, id) {
   }
 }
 
-// ── Per-user cfg (base64url) ─────────────────────────────────────────────────
+// ── Per-user config via base64url token (stateless) ───────────────────────────
 const b64u = {
   enc: (obj) => Buffer.from(JSON.stringify(obj)).toString("base64url"),
   dec: (str) => JSON.parse(Buffer.from(String(str || ""), "base64url").toString("utf8"))
 };
+
 function isDebridProviderURL(u) {
   return /alldebrid|real-?debrid|premiumize/i.test(String(u || ""));
 }
 function hasDebridApiKey(u) {
   return /(?:^|[|&?])apikey=/i.test(String(u || ""));
 }
+
 function resolveSources(extra) {
   try {
     if (extra && extra.cfg) {
       const cfg = b64u.dec(extra.cfg);
       if (cfg && typeof cfg.torrentio === "string" && /^https?:\/\//i.test(cfg.torrentio)) {
-        console.log("[AutoStream] cfg decoded:", cfg);
         return [cfg.torrentio, ...SOURCES];
       }
     }
-  } catch (e) {
-    console.warn("[AutoStream] cfg decode failed:", e?.message || e);
-  }
+  } catch (_) {}
   return SOURCES;
 }
 
@@ -234,9 +217,9 @@ builder.defineStreamHandler(async ({ type, id, extra }) => {
       return { streams: [] };
     }
 
+    // If a debrid source with apikey is present, keep 4K/2K more often
     const localPref = { ...PREF };
     if (debridOK) {
-      // keep 4K/2K more often when debrid is present
       localPref.prefer1080_ratio = Math.max(localPref.prefer1080_ratio, 3.5);
       localPref.prefer1080_delta = Math.max(localPref.prefer1080_delta, 1000);
     }
@@ -269,17 +252,20 @@ builder.defineStreamHandler(async ({ type, id, extra }) => {
     }
 
     const niceName = await getDisplayLabel(type, id);
-
-    // pass-through streams; only tidy the title
     const makeCleanWithQ = (st) => {
       const qTag = qualityTag(combinedLabel(st));
       const clean = `${niceName} — ${displayTag(qTag)}`;
+      // No resolver flow: don’t fabricate magnets; just pass through url if present
+      const normalized = {
+        ...st,
+        url: st.url || st.externalUrl || st.magnet || undefined,
+        behaviorHints: { ...(st.behaviorHints || {}), notWebReady: false, bingeGroup: id }
+      };
       return {
         obj: {
-          ...st,
+          ...normalized,
           title: clean,
-          name: "AutoStream",
-          behaviorHints: { ...(st.behaviorHints || {}), bingeGroup: id }
+          name: "AutoStream"
         },
         qScore: qualityScoreFromTag(qTag),
         rank: rankStream(st)
@@ -305,9 +291,12 @@ builder.defineStreamHandler(async ({ type, id, extra }) => {
 });
 
 // ── Configure page & server ───────────────────────────────────────────────────
+const PORT = process.env.PORT || 7000;
 const app = express();
-app.set("trust proxy", true);
 app.use(express.urlencoded({ extended: true }));
+
+// Simple CORS
+app.use((_, res, next) => { res.setHeader("Access-Control-Allow-Origin", "*"); next(); });
 
 function baseOrigin(req) {
   const xf = (req.headers["x-forwarded-proto"] || "").toString().split(",")[0].trim();
@@ -315,11 +304,13 @@ function baseOrigin(req) {
   return `${proto}://${req.get("host")}`;
 }
 
+// Build a Torrentio URL for a given provider
 // provider: 'none' | 'alldebrid' | 'real-debrid' | 'premiumize'
 function buildTorrentioUrl({ provider = "none", cached = true, apikey = "" }) {
   const p = (provider || "none").toLowerCase();
   if (p === "none") return null;
 
+  // API key is required for all debrid providers
   if (!apikey) throw new Error("API key is required for the selected debrid provider.");
 
   const slug = p.includes("real") ? "real-debrid" : p.includes("prem") ? "premiumize" : "alldebrid";
@@ -386,11 +377,8 @@ const FORM_HTML = (errorMsg = "") => `
 </div>
 `;
 
-app.get("/configure", (_req, res) => {
-  res.setHeader("Content-Type", "text/html; charset=utf-8");
-  res.end(FORM_HTML());
-});
-app.get("/", (_req, res) => res.redirect("/configure"));
+app.get("/", (_, res) => { res.setHeader("Content-Type", "text/html; charset=utf-8"); res.end(FORM_HTML()); });
+app.get("/configure", (_, res) => { res.setHeader("Content-Type", "text/html; charset=utf-8"); res.end(FORM_HTML()); });
 
 app.post("/configure", (req, res) => {
   const provider = String(req.body.provider || "none").toLowerCase();
@@ -399,7 +387,7 @@ app.post("/configure", (req, res) => {
 
   let torrentio = null;
   try {
-    torrentio = buildTorrentioUrl({ provider, cached, apikey }); // null if provider === 'none'
+    torrentio = buildTorrentioUrl({ provider, cached, apikey }); // returns null if provider === 'none'
   } catch (e) {
     res.setHeader("Content-Type", "text/html; charset=utf-8");
     return res.end(FORM_HTML(e.message));
@@ -408,6 +396,7 @@ app.post("/configure", (req, res) => {
   const cfg = torrentio ? b64u.enc({ torrentio }) : b64u.enc({});
   const origin = baseOrigin(req);
 
+  // Put cfg into the PATH so Stremio carries it across routes
   const manifestUrl = `${origin}/u/${cfg}/manifest.json`;
   const deep = `stremio://addon-install?url=${encodeURIComponent(manifestUrl)}`;
 
@@ -437,33 +426,24 @@ app.post("/configure", (req, res) => {
   </div>`);
 });
 
-// ---- Mount addon interface (router form) ------------------------------------
+// ---- Mount addon interface (⚠️ ORDER MATTERS)
 const iface = builder.getInterface();
 const router = getRouter(iface);
 
-// Plain base (no cfg)
-app.use("/", router);
-
-// Inject ?cfg=... only for the manifest/stream endpoints under /u/:cfg
-function injectCfg(req, _res, next) {
+// Config-aware base FIRST: /u/:cfg/...
+// Inject ?cfg=... back into req.query so the SDK passes it to the handler as "extra".
+app.use("/u/:cfg", (req, _res, next) => {
   req.query = Object.assign({}, req.query, { cfg: req.params.cfg });
   next();
-}
+}, router);
 
-// Config-aware endpoints (explicit, so we don't swallow /u/:cfg/anything-else)
-app.get("/u/:cfg/manifest.json", injectCfg, (req, res) => iface.manifest(req, res));
-app.get("/u/:cfg/stream/:type/:id.json", injectCfg, (req, res) => iface.get(req, res));
-app.post("/u/:cfg/stream/:type/:id.json", injectCfg, (req, res) => iface.post(req, res));
+// Plain base (no cfg) AFTER
+app.use("/", router);
 
-// Nice-to-have: if someone lands on /u/:cfg/configure, send them to the real page
-app.get("/u/:cfg/configure", (_req, res) => res.redirect("/configure"));
-
-// Generic error handler so nothing crashes
-app.use((err, req, res, _next) => {
-  console.error("[Route error]", err);
-  if (!res.headersSent) {
-    if (req.path.endsWith("/manifest.json")) return res.status(500).json({});
-    return res.status(500).json({ streams: [] });
-  }
+// Start server
+app.listen(PORT, () => {
+  console.log(`AutoStream add-on running on port ${PORT}`);
+  console.log("Primary sources:", SOURCES);
+  console.log("Fallback sources:", FALLBACK_SOURCES);
+  console.log("Lower-quality prefs:", PREF);
 });
-
