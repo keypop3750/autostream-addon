@@ -31,7 +31,7 @@ const PREF = Object.assign(
 // ── Manifest ──────────────────────────────────────────────────────────────────
 const manifest = {
   id: "org.autostream.best",
-  version: "2.0.0",
+  version: "2.0.1",
   name: "AutoStream",
   description:
     "AutoStream picks the best stream for each title, balancing quality with seeders. Optional Debrid via manifest URL params (Torrentio-style). Returns a curated best pick and (when helpful) a second 1080p option.",
@@ -133,18 +133,41 @@ function normalizeForResolver(st) {
 }
 
 // ── Upstream collection & de-dup ─────────────────────────────────────────────
-async function fetchFromSource(baseUrl, type, id) {
-  const url = `${baseUrl}/stream/${encodeURIComponent(type)}/${encodeURIComponent(id)}.json`;
-  const res = await fetch(url, { headers: { Accept: "application/json", "user-agent": "autostream/2.0" } });
-  if (!res.ok) { console.error("Upstream error:", baseUrl, res.status); return []; }
-  const data = await res.json();
-  const list = Array.isArray(data.streams) ? data.streams : [];
-  return list.map(st => ({ ...st, __source: baseUrl }));
+async function fetchFromSource(baseUrl, type, id, debridCfg) {
+  try {
+    const base = baseUrl.replace(/\/+$/, "");
+    const uBase = new URL(base);
+    const u = new URL(`${base}/stream/${encodeURIComponent(type)}/${encodeURIComponent(id)}.json`);
+
+    // If hitting Torrentio, append debrid params as query string (proper way)
+    if (/torrentio\.strem\.fun$/i.test(uBase.host) && debridCfg) {
+      if (debridCfg.debrid && debridCfg.debrid !== "none") u.searchParams.set("debrid", debridCfg.debrid);
+      if (debridCfg.cached != null) u.searchParams.set("cached", debridCfg.cached ? "true" : "false");
+      if (debridCfg.apikey) u.searchParams.set("apikey", debridCfg.apikey);
+      // keep your other prefs too, if you want:
+      u.searchParams.set("exclude", "cam,ts");
+      u.searchParams.set("audio", "english");
+      u.searchParams.set("sort", "seeders");
+    }
+
+    const res = await fetch(u.toString(), { headers: { Accept: "application/json", "user-agent": "autostream/2.0" } });
+    if (!res.ok) {
+      console.error("Upstream error:", baseUrl, res.status, u.toString());
+      return [];
+    }
+    const data = await res.json();
+    const list = Array.isArray(data.streams) ? data.streams : [];
+    return list.map(st => ({ ...st, __source: baseUrl }));
+  } catch (e) {
+    console.error("Source failed:", baseUrl, e.message || e);
+    return [];
+  }
 }
-async function collectStreams(sources, type, id) {
+
+async function collectStreams(sources, type, id, debridCfg) {
   const all = [];
   for (const src of sources) {
-    try { all.push(...await fetchFromSource(src, type, id)); }
+    try { all.push(...await fetchFromSource(src, type, id, debridCfg)); }
     catch (e) { console.error("Source failed:", src, e.message || e); }
   }
   // De-dup by url/magnet/infoHash
@@ -188,32 +211,24 @@ async function getDisplayLabel(type, id) {
 }
 
 // ── Torrentio-style config via query params in manifest URL ───────────────────
-// Stremio keeps query params and exposes them to handlers as `args.extra`. :contentReference[oaicite:1]{index=1}
-function buildTorrentioUrlFromExtra(extra = {}) {
-  const debrid = (extra.debrid || extra.dp || "none").toString();
-  const apikey = (extra.apikey || extra.api_key || extra.token || extra.k || "").toString();
-  const preferCached = !!(extra.cached === "1" || extra.cached === "true" || extra.c === "1");
-
-  if (debrid === "none" || !apikey) return null;
-
-  const slug = /real/i.test(debrid) ? "real-debrid" : /prem/i.test(debrid) ? "premiumize" : "alldebrid";
-  const params = [];
-  if (preferCached) params.push("cached=true");
-  params.push("exclude=cam,ts", "audio=english", "sort=seeders");
-  params.push("apikey=" + encodeURIComponent(apikey));
-  // Using the “pipe” header format commonly accepted by resolvers for custom params. :contentReference[oaicite:2]{index=2}
-  return `https://torrentio.strem.fun/${slug}|${params.join("&")}`;
-}
-
 function isDebridEndpoint(u) {
   return /alldebrid|real-?debrid|premiumize/i.test(String(u || ""));
 }
-
+function buildDebridConfigFromExtra(extra = {}) {
+  return {
+    debrid: (extra.debrid || extra.dp || "none").toString(),
+    apikey: (extra.apikey || extra.api_key || extra.token || extra.k || "").toString(),
+    cached: !!(extra.cached === "1" || extra.cached === "true" || extra.c === "1")
+  };
+}
 function resolveSources(extra) {
   const list = [...SOURCES];
-  const ti = buildTorrentioUrlFromExtra(extra);
-  if (ti) list.unshift(ti); // prefer user-configured debrid-first
-  return list;
+  const cfg = buildDebridConfigFromExtra(extra);
+  if (cfg.debrid !== "none" && cfg.apikey) {
+    // Put Torrentio first when user configured debrid
+    list.unshift("https://torrentio.strem.fun");
+  }
+  return { sources: list, debridCfg: cfg };
 }
 
 // prefer-lower-quality rule
@@ -232,17 +247,23 @@ function bestOfQuality(cands, wantedTag) {
 
 // ── Main stream handler ───────────────────────────────────────────────────────
 builder.defineStreamHandler(async ({ type, id, extra }) => {
+  console.log("[STREAM args]", { type, id, extra });
   try {
-    const usedSources = resolveSources(extra);
-    let candidates = await collectStreams(usedSources, type, id);
+    const { sources: usedSources, debridCfg } = resolveSources(extra);
+    const debridPreferred = usedSources.some(isDebridEndpoint);
+
+    console.log("[AutoStream] Config:", debridCfg, "Sources:", usedSources);
+
+    let candidates = await collectStreams(usedSources, type, id, debridCfg);
 
     if (candidates.length === 0) {
       console.log("No primary results; trying fallback sources …");
-      candidates = await collectStreams(FALLBACK_SOURCES, type, id);
+      candidates = await collectStreams(FALLBACK_SOURCES, type, id, debridCfg);
     }
-    if (candidates.length === 0) return { streams: [] };
-
-    const debridPreferred = usedSources.some(isDebridEndpoint);
+    if (candidates.length === 0) {
+      console.log("No streams from any source.");
+      return { streams: [] };
+    }
 
     // If Debrid is preferred, tighten downgrade thresholds
     const localPref = { ...PREF };
@@ -322,10 +343,13 @@ const PORT = process.env.PORT || 7000;
 const app = express();
 app.use(express.urlencoded({ extended: true }));
 
-// CORS (SDK usually handles this, but leaving it here doesn’t hurt). :contentReference[oaicite:3]{index=3}
+// Basic request log so you can see manifest/stream hits in Render logs
+app.use((req, _res, next) => { console.log("[REQ]", req.method, req.originalUrl); next(); });
+
+// CORS (harmless; SDK already sets headers but this helps in some envs)
 app.use((_, res, next) => { res.setHeader("Access-Control-Allow-Origin", "*"); next(); });
 
-// Render/Proxy: honor X-Forwarded-Proto so links are HTTPS (remote addons must be HTTPS). :contentReference[oaicite:4]{index=4}
+// Render/Proxy: honor X-Forwarded-Proto so links are HTTPS
 app.set("trust proxy", 1);
 function absoluteBase(req) {
   if (process.env.PUBLIC_BASE_URL) return process.env.PUBLIC_BASE_URL;
@@ -380,7 +404,8 @@ const FORM_HTML = `
     </form>
     <p><small>
       This builds a manifest URL with query params (Torrentio-style).
-      Stremio will keep those params and pass them to the add-on as <code>extra</code>. </small></p>
+      Stremio will keep those params and pass them to the add-on as <code>extra</code>.
+    </small></p>
   </div>
 </div>
 `;
