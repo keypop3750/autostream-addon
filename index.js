@@ -418,20 +418,20 @@ app.post("/configure", (req, res) => {
 });
 
 // ---- Mount addon interface
-const iface = builder.getInterface();
+const iface  = builder.getInterface();
 const router = getRouter(iface);
 
-// Plain base (no cfg)
-app.use("/", router);
-
 // Config-aware base: /u/:cfg/...
-// Inject ?cfg=... into req.query so SDK passes it as "extra" to stream handler.
+// Inject ?cfg=... so the SDK passes it as "extra" to our stream handler.
 app.use("/u/:cfg", (req, _res, next) => {
   req.query = Object.assign({}, req.query, { cfg: req.params.cfg });
   next();
 }, router);
 
-// Start server (single declaration)
+// Plain base (no cfg) — mount AFTER the /u/:cfg route
+app.use("/", router);
+
+// Start server
 const PORT = process.env.PORT || 7000;
 app.listen(PORT, () => {
   console.log(`AutoStream add-on running on port ${PORT}`);
