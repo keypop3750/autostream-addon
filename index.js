@@ -29,7 +29,7 @@ const PREF = Object.assign(
 // ── Manifest ──────────────────────────────────────────────────────────────────
 const manifest = {
   id: "org.autostream.best",
-  version: "1.8.0",
+  version: "1.8.1",
   name: "AutoStream",
   description:
     "AutoStream picks the best stream for each title, balancing quality with speed (seeders). If a lower resolution like 1080p or 720p is much faster than 4K/2K, it’s preferred for smoother playback. You’ll usually see one link; when helpful, a second 1080p option appears. Titles are neat (e.g., “Movie Name — 1080p”).",
@@ -299,7 +299,6 @@ builder.defineStreamHandler(async ({ type, id, extra }) => {
 });
 
 // ── Configure page & server ───────────────────────────────────────────────────
-const PORT = process.env.PORT || 7000;
 const app = express();
 app.use(express.urlencoded({ extended: true }));
 
@@ -388,7 +387,7 @@ app.post("/configure", (req, res) => {
   const cfg = b64u.enc({ torrentio });
 
   const origin = baseOrigin(req);
-  // IMPORTANT: put cfg in the PATH, not the query, so Stremio keeps it for all routes
+  // IMPORTANT: embed cfg in the PATH so Stremio keeps it for all requests
   const manifestUrl = `${origin}/u/${cfg}/manifest.json`;
   const deep = `stremio://addon-install?url=${encodeURIComponent(manifestUrl)}`;
 
@@ -426,12 +425,13 @@ const router = getRouter(iface);
 app.use("/", router);
 
 // Config-aware base: /u/:cfg/...
-// We inject ?cfg=... back into req.query so the SDK passes it as "extra" to stream handler.
+// Inject ?cfg=... into req.query so SDK passes it as "extra" to stream handler.
 app.use("/u/:cfg", (req, _res, next) => {
   req.query = Object.assign({}, req.query, { cfg: req.params.cfg });
   next();
 }, router);
 
+// Start server (single declaration)
 const PORT = process.env.PORT || 7000;
 app.listen(PORT, () => {
   console.log(`AutoStream add-on running on port ${PORT}`);
