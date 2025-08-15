@@ -29,7 +29,7 @@ const PREF = Object.assign(
 // ── Manifest ──────────────────────────────────────────────────────────────────
 const manifest = {
   id: "org.autostream.best",
-  version: "1.9.1",
+  version: "1.9.2",
   name: "AutoStream",
   description:
     "AutoStream picks the best stream for each title, balancing quality with speed (seeders). If a lower resolution like 1080p or 720p is much faster than 4K/2K, it’s preferred for smoother playback. You’ll usually see one link; when helpful, a second 1080p option appears. Titles are neat (e.g., “Movie Name — 1080p”).",
@@ -101,31 +101,6 @@ function rankStream(st) {
   return q + speed + preferenceBonus(label);
 }
 
-// Prefer magnets so resolvers (e.g., Debrid) can catch them (used as fallback)
-const COMMON_TRACKERS = [
-  "udp://tracker.opentrackr.org:1337/announce",
-  "udp://open.stealth.si:80/announce",
-  "udp://tracker.torrent.eu.org:451/announce"
-];
-function buildMagnet(st) {
-  if (typeof st.magnet === "string" && st.magnet.startsWith("magnet:")) return st.magnet;
-  const infoHash = st.infoHash || st.infohash || st.hash;
-  if (!infoHash) return null;
-  const dn = encodeURIComponent((st.title || st.name || "AutoStream").replace(/\s+/g, " "));
-  const tr = COMMON_TRACKERS.map(t => "&tr=" + encodeURIComponent(t)).join("");
-  return `magnet:?xt=urn:btih:${infoHash}&dn=${dn}${tr}`;
-}
-function normalizeForResolver(st) {
-  const magnet = buildMagnet(st);
-  const url = st.url || st.externalUrl || magnet || null;
-  return {
-    ...st,
-    url,
-    magnet: magnet || st.magnet,
-    behaviorHints: { ...(st.behaviorHints || {}), notWebReady: false }
-  };
-}
-
 // ── Fetch from upstreams ──────────────────────────────────────────────────────
 async function fetchFromSource(baseUrl, type, id) {
   const url = `${baseUrl}/stream/${encodeURIComponent(type)}/${encodeURIComponent(id)}.json`;
@@ -189,7 +164,6 @@ const b64u = {
   dec: (str) => JSON.parse(Buffer.from(String(str || ""), "base64url").toString("utf8"))
 };
 
-// identify debrid source + whether it has an API key
 function isDebridProviderURL(u) {
   return /alldebrid|real-?debrid|premiumize/i.test(String(u || ""));
 }
@@ -238,7 +212,10 @@ builder.defineStreamHandler(async ({ type, id, extra }) => {
       console.log("No primary results; trying fallback sources …");
       candidates = await collectStreams(FALLBACK_SOURCES, type, id);
     }
-    if (candidates.length === 0) return { streams: [] };
+    if (candidates.length === 0) {
+      console.log("No streams from any source.");
+      return { streams: [] };
+    }
 
     // If a debrid source with apikey is present, keep 4K/2K more often
     const localPref = { ...PREF };
@@ -278,13 +255,17 @@ builder.defineStreamHandler(async ({ type, id, extra }) => {
     const makeCleanWithQ = (st) => {
       const qTag = qualityTag(combinedLabel(st));
       const clean = `${niceName} — ${displayTag(qTag)}`;
-      const normalized = normalizeForResolver(st);
+      // No resolver flow: don’t fabricate magnets; just pass through url if present
+      const normalized = {
+        ...st,
+        url: st.url || st.externalUrl || st.magnet || undefined,
+        behaviorHints: { ...(st.behaviorHints || {}), notWebReady: false, bingeGroup: id }
+      };
       return {
         obj: {
           ...normalized,
           title: clean,
-          name: "AutoStream",
-          behaviorHints: { ...(normalized.behaviorHints || {}), bingeGroup: id }
+          name: "AutoStream"
         },
         qScore: qualityScoreFromTag(qTag),
         rank: rankStream(st)
@@ -445,20 +426,21 @@ app.post("/configure", (req, res) => {
   </div>`);
 });
 
-// ---- Mount addon interface
+// ---- Mount addon interface (⚠️ ORDER MATTERS)
 const iface = builder.getInterface();
 const router = getRouter(iface);
 
-// Base (no cfg)
-app.use("/", router);
-
-// Config-aware base: /u/:cfg/...
-// We inject ?cfg=... back into req.query so the SDK passes it to the handler as "extra".
+// Config-aware base FIRST: /u/:cfg/...
+// Inject ?cfg=... back into req.query so the SDK passes it to the handler as "extra".
 app.use("/u/:cfg", (req, _res, next) => {
   req.query = Object.assign({}, req.query, { cfg: req.params.cfg });
   next();
 }, router);
 
+// Plain base (no cfg) AFTER
+app.use("/", router);
+
+// Start server
 app.listen(PORT, () => {
   console.log(`AutoStream add-on running on port ${PORT}`);
   console.log("Primary sources:", SOURCES);
