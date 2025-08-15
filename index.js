@@ -18,8 +18,8 @@ const FALLBACK_SOURCES = Array.isArray(config.fallback_sources) ? config.fallbac
 // ── Defaults for lower-quality preference knobs ───────────────────────────────
 const PREF = Object.assign(
   {
-    prefer2160_ratio: 1.5,     // how much faster a lower quality must be to win (ratio)
-    prefer2160_delta: 250,     // …or absolute seeders advantage
+    prefer2160_ratio: 1.5,
+    prefer2160_delta: 250,
     prefer1440_ratio: 1.7,
     prefer1440_delta: 350,
     prefer1080_ratio: 2.0,
@@ -42,9 +42,11 @@ const manifest = {
   resources: ["stream"],
   types: ["movie", "series"],
   idPrefixes: ["tt", "kitsu", "local"],
+  // ✅ required by stremio-addon-linter
+  catalogs: [],
   behaviorHints: {
     configurable: true
-  },
+  }
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -77,7 +79,6 @@ function extractSeeders(s) {
   if (!s || !s.title) return null;
   const m = s.title.match(/\b(\d{1,6})\s*seed/i);
   if (m) return parseInt(m[1], 10);
-  // torrentio style "S:123"
   const m2 = s.title.match(/\bS:(\d{1,6})\b/i);
   if (m2) return parseInt(m2[1], 10);
   return null;
@@ -108,17 +109,18 @@ function bestOfQuality(cands, q) {
 }
 
 function normalizeSourceURL(u) {
-  // Accept bare base URL or full URLs with params
   if (!/^https?:\/\//i.test(u)) return null;
   return u.trim();
 }
 
 function applyCfgToSources(base, cfg) {
-  // If cfg.debrid is set, prepend debrid-aware source first
   const list = [...base];
   if (cfg && cfg.debrid && cfg.debrid !== "none" && cfg.apiKey) {
-    // Example: torrentio with RD
-    const rd = `https://torrentio.strem.fun/${encodeURI(`debrid=${cfg.debrid}`)}&cached=${cfg.preferCached ? "true" : "false"}&apikey=${encodeURIComponent(cfg.apiKey)}`;
+    // NOTE: tune this to the exact params your upstream source expects
+    const debridParam = `debrid=${encodeURIComponent(cfg.debrid)}`;
+    const cachedParam = `cached=${cfg.preferCached ? "true" : "false"}`;
+    const keyParam = `apikey=${encodeURIComponent(cfg.apiKey)}`;
+    const rd = `https://torrentio.strem.fun/${debridParam}&${cachedParam}&${keyParam}`;
     list.unshift(rd);
   }
   return list.filter(Boolean).map(normalizeSourceURL).filter(Boolean);
@@ -126,7 +128,6 @@ function applyCfgToSources(base, cfg) {
 
 function decodeCfgToken(token) {
   try {
-    // base64url json: { debrid: "real-debrid"|"premiumize"|"none", apiKey: "...", preferCached: true }
     const json = Buffer.from(token, "base64url").toString("utf8");
     const obj = JSON.parse(json);
     return {
@@ -141,9 +142,7 @@ function decodeCfgToken(token) {
 
 function resolveSources(extra) {
   let cfg = null;
-  if (extra && extra.cfg) {
-    cfg = decodeCfgToken(extra.cfg);
-  }
+  if (extra && extra.cfg) cfg = decodeCfgToken(extra.cfg);
   const withCfg = applyCfgToSources(SOURCES, cfg);
   return withCfg.length ? withCfg : SOURCES;
 }
@@ -194,13 +193,8 @@ addon.defineStreamHandler(async ({ type, id, extra }) => {
       return { streams: [] };
     }
 
-    // Basic curation: keep reasonable items only
-    const curated = candidates.filter(s => {
-      const label = combinedLabel(s);
-      return /720p|1080p|1440p|2160p|4k/i.test(label);
-    });
+    const curated = candidates.filter(s => /720p|1080p|1440p|2160p|4k/i.test(combinedLabel(s)));
 
-    // Choose the single best stream with seed-aware downgrades
     const best2160 = bestOfQuality(curated, "2160p");
     const best1440 = bestOfQuality(curated, "1440p");
     const best1080 = bestOfQuality(curated, "1080p");
@@ -214,20 +208,20 @@ addon.defineStreamHandler(async ({ type, id, extra }) => {
       "DebridPreferred:", debridOK
     );
 
-    const curTagA = qualityTag(combinedLabel(curated));
-    // Prefer lower quality if it’s much faster (configurable thresholds)
-    if ((curTagA === "2160p" || curTagA === "1440p") && best1080 &&
-        isMuchFaster(best1080, best2160 || best1440 || best1080, { ratio: PREF.prefer1080_ratio, delta: PREF.prefer1080_delta })) {
-      return { streams: [best1080] };
-    }
-    if ((curTagA === "2160p" || curTagA === "1440p" || curTagA === "1080p") && best720 &&
-        isMuchFaster(best720, best1080 || best1440 || best2160 || best720, { ratio: PREF.prefer720_ratio, delta: PREF.prefer720_delta })) {
-      return { streams: [best720] };
-    }
+    // Choose with seed-aware downgrades
+    const top = best2160 || best1440 || best1080 || best720 || curated[0];
+    let final = top;
 
-    // Otherwise, pick the highest quality candidate that exists
-    const final =
-      best2160 || best1440 || best1080 || best720 || curated[0];
+    if (top && best1080 && (qualityTag(combinedLabel(top)) === "2160p" || qualityTag(combinedLabel(top)) === "1440p")) {
+      if (isMuchFaster(best1080, top, { ratio: PREF.prefer1080_ratio, delta: PREF.prefer1080_delta })) {
+        final = best1080;
+      }
+    }
+    if (final && best720 && ["2160p", "1440p", "1080p"].includes(qualityTag(combinedLabel(final)))) {
+      if (isMuchFaster(best720, final, { ratio: PREF.prefer720_ratio, delta: PREF.prefer720_delta })) {
+        final = best720;
+      }
+    }
 
     return { streams: final ? [final] : [] };
   } catch (e) {
@@ -326,9 +320,8 @@ app.get("/install", (req, res) => {
 // ---- Mount addon interface (⚠️ ORDER MATTERS)
 const router = getRouter(addon.getInterface());
 
-// Per-user config prefix: ensure the token becomes real querystring (?cfg=…)
+// Per-user config prefix: inject ?cfg=… so SDK exposes it as extra.cfg
 app.use("/u/:cfg", (req, _res, next) => {
-  // Inject cfg into the real querystring so Stremio SDK exposes it as extra.cfg
   const [pathOnly, qstr = ""] = req.url.split("?");
   const qs = new URLSearchParams(qstr);
   qs.set("cfg", req.params.cfg);
